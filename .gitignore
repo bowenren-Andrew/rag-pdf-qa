@@ -1,0 +1,28 @@
+# 环境变量：含 API Key，绝不提交
+.env
+*.env
+
+# Streamlit 本地密钥文件（同样含敏感信息）
+.streamlit/secrets.toml
+
+# 本地向量库与会话历史（运行时数据）
+chroma_db/
+sessions/
+
+# Python 缓存
+__pycache__/
+*.pyc
+*.pyo
+
+# 测试缓存
+.pytest_cache/
+
+# 虚拟环境
+venv_pdf_qa/
+.venv/
+venv/
+
+# 编辑器/系统文件
+.vscode/
+.idea/
+.DS_Store

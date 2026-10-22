@@ -1,0 +1,9 @@
+streamlit>=1.32.0
+PyPDF2>=3.0.0
+sentence-transformers>=2.7.0
+chromadb>=0.5.0
+openai>=1.30.0
+python-dotenv>=1.0.0
+
+# 仅用于运行 tests/ 下的单元测试，部署时可省略
+pytest>=8.0.0
