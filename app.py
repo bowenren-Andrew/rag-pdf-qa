@@ -26,6 +26,26 @@ os.makedirs(SESSION_DIR, exist_ok=True)
 st.set_page_config(page_title="PDF 智能问答 v2", page_icon="📄", layout="wide")
 
 
+# ---------- 云端适配：把 Streamlit Secrets 同步进环境变量 ----------
+def _sync_secrets_to_env():
+    """
+    Streamlit Cloud 上配置的 Secrets 不一定自动出现在 os.environ 里，
+    而 qa.py 是用 os.getenv() 读 Key 的。这里显式同步一次，
+    保证「本地 .env」和「云端 Secrets」两种部署方式走同一套读取逻辑。
+    """
+    try:
+        for key in ("DEEPSEEK_API_KEY", "APP_PASSWORD"):
+            if not os.environ.get(key):  # 已存在的环境变量不覆盖
+                value = st.secrets.get(key, "")
+                if value:
+                    os.environ[key] = str(value)
+    except Exception:
+        pass  # 本地没有 secrets.toml 时会抛异常，忽略即可
+
+
+_sync_secrets_to_env()
+
+
 # ---------- 访问密码（可选功能，未配置则自动跳过）----------
 def _get_access_password() -> str:
     """

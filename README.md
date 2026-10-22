@@ -31,6 +31,7 @@
 - **会话管理**：新建 / 加载 / 删除历史会话，每轮问答自动保存为本地 JSON
 - **中文向量检索**：`BAAI/bge-small-zh-v1.5`，检索 query 自动加 BGE 官方指令前缀
 - **重启不丢数据**：向量库持久化到 `chroma_db/`，已入库文档无需重新处理
+- **可选访问密码**：配置 `APP_PASSWORD` 后需输密码才能进入，未配置则完全不启用（本地无感）
 
 ---
 
@@ -169,18 +170,21 @@ git add . && git commit -m "feat: RAG PDF QA v2" && git push
 
 1. 打开 [share.streamlit.io](https://share.streamlit.io/)，用 GitHub 账号登录
 2. 点 **New app** → 选择仓库、分支
-3. **Main file path** 填 `pdf_qa_app/app.py`（若仓库根目录就是本项目，则填 `app.py`）
+3. **Main file path** 填 `app.py`（本仓库根目录即项目根目录）
 4. Python version 选 **3.10+**
 
-### 3. 配置密钥（关键）
+### 3. 配置密钥与访问密码（关键）
 
-在应用页面 → **Settings → Secrets** 填入：
+在应用页面 → **Settings → Secrets** 填入（TOML 格式）：
 
 ```toml
 DEEPSEEK_API_KEY = "sk-你的DeepSeekKey"
+APP_PASSWORD = "你想设置的访问密码"   # 不需要密码就删掉这一行
 ```
 
-保存后应用会自动重启。代码 `load_dotenv(override=False)` 不会覆盖云端注入的环境变量，因此 Secrets 优先生效。
+保存后应用会自动重启。`load_dotenv(override=False)` 不会覆盖云端注入的环境变量，因此 Secrets 优先生效。
+
+> **访问密码说明**：配置了 `APP_PASSWORD` 后，打开应用会先要求输入密码，验证通过才进入主界面（同一浏览器会话内只需输一次）。本地开发不配置该变量时，密码功能自动关闭，完全无感。详见 `部署指南_GitHub与StreamlitCloud.md`。
 
 ### 4. 等待首次构建
 
