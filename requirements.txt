@@ -1,3 +1,9 @@
+# 云端（Linux）只装 CPU 版 torch：避免 pip 默认拉取整套 CUDA/nvidia 包（数 GB），
+# 能显著缩短 Streamlit Cloud 的构建时间并降低内存占用。
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.14.1+cpu ; sys_platform == "linux"
+torch>=2.0 ; sys_platform != "linux"
+
 streamlit>=1.32.0
 PyPDF2>=3.0.0
 sentence-transformers>=2.7.0

@@ -188,10 +188,55 @@ streamlit run app.py
 | 容器重启后文档没了 | 云端无持久磁盘 | 已知限制，重启后需重新上传 PDF（见 README 云端注意事项表） |
 | 内存超限被杀（OOM） | 免费版约 1GB | 一次不要上传过多/过大的 PDF；可改用 `bge-small` 已是最省方案 |
 | 应用长时间无人访问后打不开 | 免费版会休眠 | 打开时会自动唤醒，等 1–2 分钟即可 |
+| **一直转圈、几分钟进不去** | 云端构建/冷启动慢，多数是 `torch` 拉了 CUDA 全家桶 | 见下节「六、一直加载的定位与解决」 |
+| 手机打不开但电脑能开 | 手机切后台/锁屏会断开 WebSocket | 保持前台、别锁屏；回到应用后手动刷新页面 |
 
 ---
 
-## 六、本次为部署所做的代码改动（两处，都在 `app.py`）
+## 六、一直加载 / 打不开的定位与解决
+
+### 6.1 先看日志（30 秒就能定位）
+
+应用页 → 右下角「管理应用」→ 打开 **Logs**，对照下表：
+
+| 日志里看到 | 说明 | 怎么办 |
+| --- | --- | --- |
+| `Installing dependencies...` / 一堆 pip 下载进度 | **还在装依赖**，没构建完 | 等着，torch 是大头（见 6.2） |
+| `Downloading BAAI/bge-small-zh-v1.5` | 正在下向量模型（约 100MB） | 等 1–3 分钟 |
+| 反复出现 `App is starting` 后消失 | **容器被内存限制杀掉**（OOM） | 见 6.3 |
+| 红色 Traceback | 代码/依赖报错 | 把报错发出来排查 |
+
+### 6.2 头号原因：torch 默认装 CUDA 版（已修复）
+
+`sentence-transformers` 依赖 `torch`。在 **Linux** 上 `pip install torch` 会连带拉 `nvidia-*` 一整套 CUDA 包，
+**总体积数 GB**，而 Streamlit Cloud 免费版磁盘与构建时间都有限，于是表现就是"永远在启动"。
+
+已在 `requirements.txt` 中修复：
+
+```ini
+--extra-index-url https://download.pytorch.org/whl/cpu
+torch==2.14.1+cpu ; sys_platform == "linux"     # 云端只装 CPU 版，约 200MB
+torch>=2.0 ; sys_platform != "linux"            # 本地 Windows/macOS 不受影响
+```
+
+> 改完依赖后必须让云端**重新构建**：Manage app → **Reboot**（必要，否则仍用旧依赖）。
+
+### 6.3 内存接近上限时的减负手段
+
+免费版约 1GB 内存，`torch + chromadb + BGE 模型` 同时加载比较吃紧：
+
+- Advanced settings 里 Python 版本建议选 **3.11 或 3.12**
+- 一次不要上传过多 PDF（向量常驻内存）
+- 若日志显示 OOM 反复重启，可考虑改用更轻量的嵌入方案（如 ONNX 量化版 bge-small）
+
+### 6.4 手机访问的两个坑
+
+1. **切后台/锁屏会断开 WebSocket**：Streamlit 靠长连接通信，断开后页面会一直转圈，回到前台需**手动刷新**
+2. **首次构建期间不要反复刷新**：每次刷新都会打断构建进度，建议先用电脑开着日志看进度
+
+---
+
+## 七、本次为部署所做的代码改动（两处，都在 `app.py`）
 
 1. **`_sync_secrets_to_env()`** —— 云端适配。Streamlit Cloud 的 Secrets 不保证自动进入 `os.environ`，而 `qa.py` 是用 `os.getenv()` 读 Key 的。显式同步一次，保证「本地 `.env`」和「云端 Secrets」走同一套读取逻辑。
 2. **`check_password()` / `_get_access_password()`** —— 访问密码。按上述优先级读密码，未配置则自动跳过；通过 `st.session_state` 记住登录状态，用 `st.stop()` 拦截未授权访问。
@@ -200,7 +245,7 @@ streamlit run app.py
 
 ---
 
-## 七、安全提醒
+## 八、安全提醒
 
 - `.env` 已在 `.gitignore` 中，**永远不要**把它提交到任何仓库（尤其是公开仓库）
 - 云端密钥只走 Streamlit Secrets，它加密存储、仅你可见、不会出现在代码里
