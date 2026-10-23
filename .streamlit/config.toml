@@ -1,0 +1,15 @@
+# Streamlit 界面主题配置（简洁现代浅色风）
+[theme]
+# 主色：深蓝
+primaryColor = "#2563EB"
+# 主背景：白色
+backgroundColor = "#FFFFFF"
+# 侧边栏与卡片背景：浅灰
+secondaryBackgroundColor = "#F3F4F6"
+# 正文色：深灰，避免纯黑刺眼
+textColor = "#111827"
+# 字体：默认无衬线
+font = "sans serif"
+
+[browser]
+gatherUsageStats = false

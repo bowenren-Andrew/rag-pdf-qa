@@ -1,9 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-qa.py（v2）
+qa.py（v3）
 职责：调用 DeepSeek API 生成回答（单一职责，不涉及界面与向量库）。
-- API Key 从项目根目录的 .env 文件读取（python-dotenv）；
-  系统环境变量优先级更高（load_dotenv 默认不覆盖已有变量）。
+- v3 变更：API Key **不再读全局环境变量**，改为由调用方传入（每位用户使用自己在
+  「设置」页填写、经 Fernet 加密保存后解密出来的 Key）；
+  仅保留 get_api_key() 作为本地开发/单元测试的兼容回退。
 - 提供三种能力：
   1) generate_answer     —— 非流式回答（备用一次性调用）
   2) stream_answer       —— 流式回答（逐段 yield，供 st.write_stream 使用）
@@ -41,20 +42,26 @@ class QAFriendlyError(Exception):
 
 
 def get_api_key() -> str:
-    """读取 API Key（来自系统环境变量或 .env 文件），未配置时返回空字符串。"""
+    """
+    读取全局兜底 Key（系统环境变量或 .env）。
+    v3 说明：主路径已改为"每位用户用自己的 Key"，此函数仅作为本地开发与单元测试的兼容回退。
+    """
     return os.environ.get("DEEPSEEK_API_KEY", "").strip()
 
 
-def _require_client() -> OpenAI:
-    """校验 API Key 并创建客户端；Key 缺失时给出中文提示。"""
-    api_key = get_api_key()
-    if not api_key:
+def _require_client(api_key: str = None) -> OpenAI:
+    """
+    校验 API Key 并创建客户端。
+    :param api_key: 当前登录用户的明文 Key（由 auth 模块解密后传入）；
+                    不传时回退读全局环境变量（本地兼容/测试用）。
+    Key 缺失时抛出中文友好提示。
+    """
+    key = (api_key or "").strip() or get_api_key()
+    if not key:
         raise QAFriendlyError(
-            "未检测到 API Key。请在项目根目录的 .env 文件中配置 "
-            "DEEPSEEK_API_KEY=你的Key（可参考 .env.example），"
-            "或设置系统环境变量后重启应用。"
+            "未检测到 API Key。请到「⚙️ 设置」页填写你自己的 DeepSeek Key 后再提问。"
         )
-    return OpenAI(api_key=api_key, base_url=BASE_URL, timeout=60)
+    return OpenAI(api_key=key, base_url=BASE_URL, timeout=60)
 
 
 def _build_prompt(question: str, contexts: list[dict]) -> str:
@@ -74,7 +81,9 @@ def _build_prompt(question: str, contexts: list[dict]) -> str:
 def _friendly(e: Exception) -> QAFriendlyError:
     """把 SDK 异常统一转换成中文友好错误。"""
     if isinstance(e, AuthenticationError):
-        return QAFriendlyError("DeepSeek API Key 无效或已过期，请检查 .env 中的 DEEPSEEK_API_KEY。")
+        return QAFriendlyError(
+            "你填写的 DeepSeek API Key 无效或已过期，请到「⚙️ 设置」页更新。"
+        )
     if isinstance(e, APITimeoutError):
         return QAFriendlyError("调用 DeepSeek API 超时，请检查网络后重试。")
     if isinstance(e, APIConnectionError):
@@ -84,9 +93,9 @@ def _friendly(e: Exception) -> QAFriendlyError:
     return QAFriendlyError(f"调用 DeepSeek API 失败：{e}")
 
 
-def generate_answer(question: str, contexts: list[dict]) -> str:
+def generate_answer(question: str, contexts: list[dict], api_key: str = None) -> str:
     """非流式生成回答（一次性返回完整文本，备用）。"""
-    client = _require_client()
+    client = _require_client(api_key)
     if not contexts:
         raise QAFriendlyError("没有检索到相关内容，请先上传并成功解析 PDF 文件。")
     try:
@@ -103,9 +112,11 @@ def generate_answer(question: str, contexts: list[dict]) -> str:
         raise _friendly(e)
 
 
-def stream_answer(question: str, contexts: list[dict]) -> Iterator[str]:
+def stream_answer(
+    question: str, contexts: list[dict], api_key: str = None
+) -> Iterator[str]:
     """流式生成回答：逐段 yield 文本，配合 st.write_stream 实现打字机效果。"""
-    client = _require_client()
+    client = _require_client(api_key)
     if not contexts:
         raise QAFriendlyError("没有检索到相关内容，请先上传并成功解析 PDF 文件。")
     try:
@@ -129,12 +140,14 @@ def stream_answer(question: str, contexts: list[dict]) -> Iterator[str]:
         raise _friendly(e)
 
 
-def generate_doc_brief(filename: str, contexts: list[dict]) -> dict:
+def generate_doc_brief(
+    filename: str, contexts: list[dict], api_key: str = None
+) -> dict:
     """
     文档上传后自动生成：全文摘要 + 3 个推荐问题。
     :return: {"summary": 摘要文本, "questions": [问题1, 问题2, 问题3]}
     """
-    client = _require_client()
+    client = _require_client(api_key)
     refs = "\n\n".join(
         f"【片段{i}】（第{c['page']}页）\n{c['text']}" for i, c in enumerate(contexts, start=1)
     )

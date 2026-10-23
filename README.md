@@ -24,14 +24,16 @@
 
 ## 二、功能特性
 
-- **多 PDF 上传**：一次选择多个文件批量入库，已入库文档自动跳过，不重复向量化
+- **多 PDF 上传**：一次选择多个文件批量入库，已入库文档自动跳过，不重复向量化；支持逐文档删除后重新上传
 - **流式回答**：`stream` 模式逐字输出，打字机效果，无需等待完整响应
 - **引用可溯源**：回答下方折叠展示命中的原文片段，标注文件名、页码、相似度百分比
 - **自动摘要 + 推荐问题**：文档入库后自动生成全文摘要与 3 个推荐问题，点击即可直接提问
-- **会话管理**：新建 / 加载 / 删除历史会话，每轮问答自动保存为本地 JSON
+- **账号体系（v3）**：注册 / 登录后才可使用，密码用 PBKDF2 加盐哈希存储，绝不明文
+- **数据隔离（v3）**：知识库与会话都按 `user_id` 隔离，用户之间互相看不到对方的文档与会话
+- **各自的 Key（v3）**：每位用户在「⚙️ 设置」页填写自己的 DeepSeek Key，Fernet 加密入库，界面只显示掩码
+- **会话管理**：新建 / 加载 / 删除历史会话，每轮问答自动保存到数据库（本地 sqlite 或云端 Postgres）
 - **中文向量检索**：`BAAI/bge-small-zh-v1.5`，检索 query 自动加 BGE 官方指令前缀
-- **重启不丢数据**：向量库持久化到 `chroma_db/`，已入库文档无需重新处理
-- **可选访问密码**：配置 `APP_PASSWORD` 后需输密码才能进入，未配置则完全不启用（本地无感）
+- **三页面结构（v3）**：💬 问答 / 📁 我的文档 / ⚙️ 设置，用 `st.navigation` 组织
 
 ---
 
@@ -57,36 +59,43 @@
 | 界面 | Streamlit | 纯 Python 写 Web UI，无需前端代码 |
 | PDF 解析 | PyPDF2 | 逐页提取文本并清洗 |
 | 向量模型 | sentence-transformers · `BAAI/bge-small-zh-v1.5` | 中文语义向量，约 100MB，输出 512 维 |
-| 向量库 | Chroma（`PersistentClient`） | 本地持久化，余弦距离检索 |
+| 向量库 | Chroma（`PersistentClient`） | 每个用户一个 collection，余弦距离检索 |
 | 大模型 | DeepSeek（`deepseek-chat`） | OpenAI 兼容 SDK，支持流式 |
-| 配置 | python-dotenv | 从 `.env` 读取 `DEEPSEEK_API_KEY` |
+| 数据库 | SQLAlchemy + sqlite / Postgres | 本地 sqlite，云端接 Supabase Postgres |
+| 密码与加密 | hashlib.pbkdf2_hmac + cryptography.Fernet | 密码加盐哈希，用户 Key 对称加密 |
+| 配置 | python-dotenv | 从 `.env` 读取 `DATABASE_URL` / `APP_SECRET_KEY` |
 
 ### 4.2 模块职责
 
 | 文件 | 职责 | 关键接口 |
 | --- | --- | --- |
-| `app.py` | 界面与交互：上传、流式聊天、来源展示、会话管理 | `handle_question()` / `render_sources()` / `save_current_session()` |
-| `loader.py` | PDF 文本提取与切分 | `load_and_split_pdf(file)` → `[{text, page}]` |
-| `vectorstore.py` | 向量化与相似检索 | `add_document()` / `similarity_search()` / `document_exists()` / `list_documents()` |
-| `qa.py` | 调用 DeepSeek 生成回答 | `stream_answer()` / `generate_answer()` / `generate_doc_brief()` / `get_api_key()` |
+| `app.py` | 界面与交互：登录注册、三页导航、流式聊天、来源展示 | `render_auth_page()` / `page_chat()` / `page_documents()` / `page_settings()` |
+| `loader.py` | PDF 文本提取与切分（v3 未改动） | `load_and_split_pdf(file)` → `[{text, page}]` |
+| `vectorstore.py` | 向量化与相似检索（按用户隔离） | `add_document(user_id, ...)` / `similarity_search(user_id, ...)` / `delete_document(user_id, ...)` |
+| `qa.py` | 调用 DeepSeek 生成回答（Key 由调用方传入） | `stream_answer(q, ctx, api_key=)` / `generate_doc_brief(...)` |
+| `db.py` | v3 新增：表定义与数据读写 | `init_db()` / `create_session()` / `list_sessions(user_id)` / `save_session()` / `delete_session()` |
+| `auth.py` | v3 新增：账号体系与密钥安全 | `register()` / `login()` / `hash_password()` / `encrypt_key()` / `mask_key()` |
 
 ### 4.3 数据流转
 
 ```mermaid
 flowchart TD
-    A[上传 PDF] --> B[loader.py<br/>PyPDF2 提取 + 清洗]
-    B --> C[切分：约 500 字/段<br/>段间约 50 字重叠]
-    C --> D[vectorstore.py<br/>BGE 中文向量化]
-    D --> E[(Chroma<br/>chroma_db/)]
+    A[注册 / 登录] --> A1[(users 表<br/>密码哈希 + 加密 Key)]
+    A1 --> B[上传 PDF]
+    B --> C[loader.py<br/>PyPDF2 提取 + 清洗]
+    C --> D[切分：约 500 字/段<br/>段间约 50 字重叠]
+    D --> E[vectorstore.py<br/>BGE 中文向量化]
+    E --> F[(Chroma<br/>pdf_chunks_u{user_id})]
 
-    F[用户提问] --> G[query 向量化<br/>加 BGE 指令前缀]
-    E --> H[相似检索 Top-4]
-    G --> H
-    H --> I[qa.py 拼接提示词]
-    I --> J[DeepSeek deepseek-chat]
-    J --> K[流式输出回答]
-    H --> L[折叠展示原文片段<br/>+ 页码 + 相似度]
-    K --> M[自动保存到 sessions/*.json]
+    G[用户提问] --> H[取用户解密后的 Key]
+    H --> I[query 向量化<br/>加 BGE 指令前缀]
+    F --> J[相似检索 Top-4<br/>仅限本人 collection]
+    I --> J
+    J --> K[qa.py 拼接提示词]
+    K --> L[DeepSeek deepseek-chat]
+    L --> M[流式输出回答]
+    J --> N[折叠展示原文片段<br/>+ 页码 + 相似度]
+    M --> O[(sessions 表<br/>按 user_id 隔离)]
 ```
 
 ### 4.4 文本切分策略
@@ -121,22 +130,28 @@ pip install -r requirements.txt
 
 > 依赖：`streamlit`、`PyPDF2`、`sentence-transformers`、`chromadb`、`openai`、`python-dotenv`
 
-### 3. 配置 API Key
-
-复制模板并填入自己的 Key（在 [DeepSeek 控制台](https://platform.deepseek.com/) 申请）：
+### 3. 配置环境变量
 
 ```bash
 cp .env.example .env
 ```
 
-编辑 `.env`：
+v3 只需要配一行 `APP_SECRET_KEY`（用于加密保存每位用户的 DeepSeek Key）：
 
-```ini
-DEEPSEEK_API_KEY=sk-你的DeepSeekKey
+```bash
+# 生成一把随机密钥，把输出粘到 .env 里
+python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
 ```
 
-> 也可以直接用系统环境变量（优先级高于 `.env`）；
-> Windows PowerShell：`setx DEEPSEEK_API_KEY "你的Key"`，设置后需重开终端。
+```ini
+APP_SECRET_KEY=粘贴上面命令生成的字符串
+```
+
+`DATABASE_URL` 本地**可以留空**，程序会自动使用项目下的 sqlite 文件 `app.db`。
+
+> v3 说明：`DEEPSEEK_API_KEY` 与 `APP_PASSWORD` 都已废弃——
+> API Key 改由每位用户在「⚙️ 设置」页填写，门禁改由账号登录取代。
+> 也可以直接用系统环境变量配置（优先级高于 `.env`）。
 
 ### 4. 启动应用
 
@@ -148,10 +163,12 @@ streamlit run app.py
 
 ### 5. 开始使用
 
-1. 左侧「文档管理」上传一个或多个 PDF → 点「解析并入库」
-2. 首次运行会自动从 `hf-mirror` 下载向量模型（约 100MB），请耐心等待
-3. 主区查看自动生成的摘要，或直接点击推荐问题
-4. 底部输入框提问，回答流式输出，展开「📚 命中原文片段与相似度」核对依据
+1. 首次打开是登录页：切到「注册」创建账号（用户名 3–20 位字母/数字/下划线，密码至少 8 位）
+2. 登录后进「⚙️ 设置」页，填入你的 DeepSeek Key（[申请地址](https://platform.deepseek.com/)），加密保存
+3. 进「📁 我的文档」上传一个或多个 PDF → 点「解析并入库」
+   （首次会自动从 `hf-mirror` 下载向量模型约 100MB，请耐心等待）
+4. 回「💬 问答」页查看自动摘要与推荐问题，或直接在底部输入框提问；
+   回答流式输出，展开「📚 命中原文片段与相似度」核对依据
 
 ---
 
@@ -173,18 +190,18 @@ git add . && git commit -m "feat: RAG PDF QA v2" && git push
 3. **Main file path** 填 `app.py`（本仓库根目录即项目根目录）
 4. Python version 选 **3.10+**
 
-### 3. 配置密钥与访问密码（关键）
+### 3. 配置 Secrets（关键）
 
-在应用页面 → **Settings → Secrets** 填入（TOML 格式）：
+在应用页面 → **Settings → Secrets** 填入（TOML 格式），两个变量都必填：
 
 ```toml
-DEEPSEEK_API_KEY = "sk-你的DeepSeekKey"
-APP_PASSWORD = "你想设置的访问密码"   # 不需要密码就删掉这一行
+DATABASE_URL = "postgresql://postgres.xxxx:你的密码@aws-0-xxx.pooler.supabase.com:5432/postgres"
+APP_SECRET_KEY = "你的Fernet密钥"
 ```
 
-保存后应用会自动重启。`load_dotenv(override=False)` 不会覆盖云端注入的环境变量，因此 Secrets 优先生效。
+保存后应用会自动重启。这两个变量的详细获取步骤见「七、云端部署需要配置的 Secrets」。
 
-> **访问密码说明**：配置了 `APP_PASSWORD` 后，打开应用会先要求输入密码，验证通过才进入主界面（同一浏览器会话内只需输一次）。本地开发不配置该变量时，密码功能自动关闭，完全无感。详见 `部署指南_GitHub与StreamlitCloud.md`。
+> v3 起**不再需要** `DEEPSEEK_API_KEY`（改由用户自己填写）和 `APP_PASSWORD`（改由登录体系取代）。
 
 ### 4. 等待首次构建
 
@@ -196,33 +213,74 @@ APP_PASSWORD = "你想设置的访问密码"   # 不需要密码就删掉这一�
 | 事项 | 说明 |
 | --- | --- |
 | 知识库不持久 | 云端容器重启后 `chroma_db/` 会被清空，需要重新上传 PDF（免费版无持久磁盘） |
-| 会话历史不持久 | `sessions/*.json` 同理，重启后丢失 |
-| 资源限制 | 免费版约 1GB 内存；`bge-small-zh-v1.5` + Chroma 可正常运行，但不宜上传超大 PDF |
-| 密钥安全 | 永远通过 Secrets 注入，不要把 `.env` 提交到仓库 |
+| 会话历史**持久** | 会话存在 Supabase Postgres 里，容器重启不丢（v3 相比 v2 的本地 JSON 是一大改进） |
+| 资源限制 | 免费版约 1GB 内存；`torch + bge-small-zh-v1.5 + Chroma` 比较吃紧，不宜上传超大 PDF |
+| 密钥安全 | `APP_SECRET_KEY` 与数据库连接串只走 Secrets，不要把 `.env` 提交到仓库 |
 
 ---
 
-## 七、目录结构
+## 七、云端部署需要配置的 Secrets
+
+v3 需要两个环境变量，缺一个应用就起不来：
+
+| 变量 | 作用 | 获取方式 |
+| --- | --- | --- |
+| `DATABASE_URL` | 存用户账号、加密后的 Key 和会话记录 | Supabase 项目的 Postgres 连接串（见下方步骤） |
+| `APP_SECRET_KEY` | 用 Fernet 加密每位用户的 API Key | 本地执行 `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` |
+
+> ⚠️ `APP_SECRET_KEY` 一旦更换，之前用户保存的 Key 会解密失败，
+> 届时需要请用户到「⚙️ 设置」页重新填写。
+
+### 获取 Supabase 免费 Postgres 连接串（约 3 分钟）
+
+1. 打开 [supabase.com](https://supabase.com/) → 用 GitHub 登录 → **New project**
+2. 填项目名、设置数据库密码（**保存好这个密码**），Region 建议选 **Southeast Asia (Singapore)**，免费套餐即可
+3. 项目创建完成后，左下角 **Project Settings** → **Database**
+4. 在 **Connection string** 区切换到 **URI** 标签，复制那串 `postgresql://postgres.xxxx:[YOUR-PASSWORD]@...` 的链接
+5. 把链接里的 `[YOUR-PASSWORD]` 换成你在第 2 步设置的密码
+6. 粘贴到 Streamlit Cloud 的 Secrets：
+
+```toml
+DATABASE_URL = "postgresql://postgres.xxxx:你的密码@aws-0-ap-southeast-1.pooler.supabase.com:5432/postgres"
+```
+
+首次部署时程序会自动建 `users` 和 `sessions` 两张表，不需要手工执行 SQL。
+
+> 连接失败排查：确认密码里的特殊字符已 URL 编码（如 `@` 要写成 `%40`）；
+> 若提示 SSL 相关错误，可在连接串末尾加 `?sslmode=require`。
+
+---
+
+## 八、目录结构
 
 ```
 pdf_qa_app/
-├── app.py              # Streamlit 界面（上传 / 聊天 / 来源 / 会话管理）
-├── loader.py           # PDF 解析与文本切分
-├── vectorstore.py      # 向量化与 Chroma 检索
-├── qa.py               # DeepSeek 调用（流式 / 摘要 / 推荐问题）
-├── requirements.txt    # 依赖清单
-├── .env                # API Key（本地，不提交）
-├── .env.example        # 配置模板
+├── app.py                     # Streamlit 界面（登录 + 问答 / 我的文档 / 设置 三页）
+├── loader.py                  # PDF 解析与文本切分（v3 未改动）
+├── vectorstore.py             # 向量化与检索（v3：按 user_id 隔离 collection）
+├── qa.py                      # DeepSeek 调用（v3：Key 由调用方传入）
+├── auth.py                    # v3 新增：注册登录、密码哈希、Key 加解密与掩码
+├── db.py                      # v3 新增：SQLAlchemy 数据访问（users / sessions 表）
+├── requirements.txt           # 依赖清单
+├── .env                       # 本地配置（含 APP_SECRET_KEY，不提交）
+├── .env.example               # 配置模板
 ├── .gitignore
-├── 修改说明_v2.md       # v1 → v2 改动说明
-├── chroma_db/          # 向量库（运行时生成，不提交）
-├── sessions/           # 会话历史 JSON（运行时生成，不提交）
-└── docs/screenshots/   # 功能截图占位
+├── .streamlit/config.toml     # v3 新增：界面主题（深蓝主色 / 白色卡片 / 浅灰侧栏）
+├── 修改说明_v2.md              # v1 → v2 改动说明
+├── 修改说明_v3.md              # v2 → v3 改动说明
+├── chroma_db/                 # 向量库（运行时生成，不提交）
+├── app.db                     # 本地 sqlite（不配 DATABASE_URL 时自动生成，不提交）
+└── tests/                     # 单元测试
+    ├── conftest.py            # sys.path + 临时数据库 / Fernet 密钥 fixture
+    ├── test_loader.py         # 文本切分（15 例）
+    ├── test_qa.py             # JSON 解析与错误处理（13 例）
+    ├── test_auth.py           # v3 新增：密码哈希 / Key 加解密 / 掩码（16 例）
+    └── test_sessions_isolation.py  # v3 新增：会话隔离与越权防护（6 例）
 ```
 
 ---
 
-## 八、运行测试
+## 九、运行测试
 
 测试全部使用假数据（mock），**不会调用真实 DeepSeek API、不会下载向量模型**。
 
@@ -239,7 +297,7 @@ pytest tests/test_qa.py -k JSON      # 只跑名字含 JSON 的用例
 
 当前用例：28 个，覆盖 `loader.py` 的文本清洗/切句/重叠切分/硬切兜底，以及 `qa.py` 的 JSON 解析（含代码块围栏、非法 JSON 降级）、错误处理（缺 Key / 401 / 网络失败）与流式输出拼接。
 
-## 九、常见问题
+## 十、常见问题
 
 **Q：提示"未检测到 API Key"？**
 A：确认 `.env` 与 `app.py` 同级、文件名为 `.env`（不是 `.env.txt`）、内容格式为 `DEEPSEEK_API_KEY=sk-xxx`，改完后重启应用。

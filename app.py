@@ -1,180 +1,226 @@
 # -*- coding: utf-8 -*-
 """
-app.py（v2）
-职责：Streamlit 界面（单一职责：只做交互与展示，业务逻辑在 loader/vectorstore/qa）。
-- 侧边栏：API Key 状态、会话管理（新建 / 加载 / 删除 / 自动保存）、多 PDF 上传入库
-- 主区域：文档摘要与推荐问题、流式聊天窗口、命中原文片段与相似度展示
-会话历史保存在本地 JSON 文件（./sessions 目录），不使用数据库。
+app.py（v3）
+职责：Streamlit 界面（单一职责：只做交互与展示，业务逻辑在 auth/db/loader/vectorstore/qa）。
+- v3 变更：新增账号体系（注册/登录）、session_state 保存当前用户；
+          知识库与会话按 user_id 隔离；每位用户使用自己的 DeepSeek Key。
+- 页面结构（st.navigation 多页面）：
+  1) 💬 问答      —— 聊天、流式回答、引用原文与相似度、文档摘要与推荐问题、会话管理
+  2) 📁 我的文档  —— 上传 PDF 入库（查重）、已入库列表与删除
+  3) ⚙️ 设置      —— 账号信息、API Key 管理（加密存储 + 掩码显示）、修改密码
+会话数据存放在数据库（见 db.py），不再使用本地 JSON 文件。
 运行方式：streamlit run app.py
 """
-import json
 import os
-import time
-from datetime import datetime
 
 import streamlit as st
 
+import auth
+import db
 from loader import load_and_split_pdf
-from qa import QAFriendlyError, generate_doc_brief, get_api_key, stream_answer
-from vectorstore import add_document, document_exists, list_documents, similarity_search
+from qa import QAFriendlyError, generate_doc_brief, stream_answer
+from vectorstore import (
+    add_document,
+    delete_document,
+    document_exists,
+    list_documents,
+    similarity_search,
+)
 
-# 会话文件存放目录（本地 JSON，不涉及数据库）
-PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
-SESSION_DIR = os.path.join(PROJECT_ROOT, "sessions")
-os.makedirs(SESSION_DIR, exist_ok=True)
-
-st.set_page_config(page_title="PDF 智能问答 v2", page_icon="📄", layout="wide")
+st.set_page_config(
+    page_title="PDF 智能问答",
+    page_icon="📄",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
 
 
 # ---------- 云端适配：把 Streamlit Secrets 同步进环境变量 ----------
 def _sync_secrets_to_env():
     """
     Streamlit Cloud 上配置的 Secrets 不一定自动出现在 os.environ 里，
-    而 qa.py 是用 os.getenv() 读 Key 的。这里显式同步一次，
+    而 db.py / auth.py 是读环境变量的。这里显式同步一次，
     保证「本地 .env」和「云端 Secrets」两种部署方式走同一套读取逻辑。
     """
     try:
-        for key in ("DEEPSEEK_API_KEY", "APP_PASSWORD"):
+        for key in ("DATABASE_URL", "APP_SECRET_KEY"):
             if not os.environ.get(key):  # 已存在的环境变量不覆盖
                 value = st.secrets.get(key, "")
                 if value:
                     os.environ[key] = str(value)
     except Exception:
-        pass  # 本地没有 secrets.toml 时会抛异常，忽略即可
+        pass  # 本地没有 secrets.toml 时访问 st.secrets 会抛异常，忽略即可
 
 
 _sync_secrets_to_env()
 
-
-# ---------- 访问密码（可选功能，未配置则自动跳过）----------
-def _get_access_password() -> str:
-    """
-    读取访问密码，优先级：Streamlit Secrets > 系统环境变量 > .env 文件。
-    三者都没配置时返回空字符串，表示"不启用密码"，本地开发完全不受影响。
-    注意：密码只在这里读取并比对，不做任何落盘存储。
-    """
-    # 1) Streamlit Cloud 的 Secrets（或本地 .streamlit/secrets.toml）
-    try:
-        pwd = st.secrets.get("APP_PASSWORD", "")
-        if pwd:
-            return str(pwd)
-    except Exception:
-        pass  # 本地没有 secrets.toml 时访问 st.secrets 会抛异常，忽略即可
-    # 2) 系统环境变量
-    pwd = os.environ.get("APP_PASSWORD", "")
-    if pwd:
-        return pwd
-    # 3) 项目根目录 .env
-    try:
-        from dotenv import dotenv_values
-
-        values = dotenv_values(os.path.join(PROJECT_ROOT, ".env"))
-        return str(values.get("APP_PASSWORD") or "")
-    except Exception:
-        return ""
-
-
-def check_password() -> bool:
-    """未配置密码直接放行；已配置则弹登录框校验。返回 True 表示允许访问。"""
-    expected = _get_access_password()
-    if not expected:
-        return True  # 没设密码 = 不启用，本地照常使用
-    if st.session_state.get("auth_ok"):
-        return True  # 本次会话已验证过，后续刷新不再重复输入
-
-    # 用一个居中的卡片做登录界面
-    left, mid, right = st.columns([1, 2, 1])
-    with mid:
-        st.markdown("### 🔒 需要访问密码")
-        st.caption("请输入访问密码后使用本系统")
-        with st.form("login_form"):
-            pwd = st.text_input("访问密码", type="password", placeholder="请输入密码")
-            submitted = st.form_submit_button("进入", use_container_width=True)
-        if submitted:
-            if pwd == expected:
-                st.session_state["auth_ok"] = True
-                st.rerun()  # 重新运行，让页面正常渲染
-            else:
-                st.error("密码不正确，请重试")
-    return False
-
-
-# 校验不通过就停止渲染后面的所有内容（这是 Streamlit 官方推荐的拦截方式）
-if not check_password():
+try:
+    db.init_db()
+except Exception as e:
+    st.error(f"数据库连接失败：{e}")
     st.stop()
 
-st.title("📄 基于 RAG 的 PDF 问答 · v2")
-st.caption("多 PDF 入库 → 自动生成摘要与推荐问题 → 流式问答，答案附带命中原文与相似度")
 
-
-# ---------- 会话管理：本地 JSON 读写 ----------
-def _now_str() -> str:
-    """当前时间字符串，用于会话的创建/更新时间。"""
-    return datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-
-def _session_path(sid: str) -> str:
-    """会话 ID 对应的 JSON 文件路径。"""
-    return os.path.join(SESSION_DIR, f"{sid}.json")
-
-
-def list_sessions() -> list[dict]:
-    """读取所有历史会话，按更新时间倒序返回。"""
-    items = []
-    if not os.path.isdir(SESSION_DIR):
-        return items
-    for name in os.listdir(SESSION_DIR):
-        if not name.endswith(".json"):
-            continue
-        try:
-            with open(os.path.join(SESSION_DIR, name), "r", encoding="utf-8") as f:
-                items.append(json.load(f))
-        except Exception:
-            continue  # 跳过损坏的文件，不影响整体加载
-    items.sort(key=lambda x: x.get("updated_at", ""), reverse=True)
-    return items
-
-
-def save_current_session():
-    """把当前会话写入本地 JSON（自动保存）。"""
-    data = {
-        "id": st.session_state.session_id,
-        "title": st.session_state.session_title,
-        "created_at": st.session_state.session_created,
-        "updated_at": _now_str(),
-        "messages": st.session_state.messages,
-    }
-    try:
-        with open(_session_path(data["id"]), "w", encoding="utf-8") as f:
-            json.dump(data, f, ensure_ascii=False, indent=2)
-    except Exception as e:
-        st.error(f"会话保存失败：{e}")
-
-
-def delete_session(sid: str):
-    """删除指定会话文件。"""
-    path = _session_path(sid)
-    if os.path.exists(path):
-        os.remove(path)
-
-
-def new_session():
-    """新建一个空会话（不立即写文件，首次提问后自动保存）。"""
-    st.session_state.session_id = f"{int(time.time())}_{os.urandom(3).hex()}"
-    st.session_state.session_title = "新会话"
-    st.session_state.session_created = _now_str()
-    st.session_state.messages = []
+# ---------- 极少量自定义 CSS：只做圆角、分隔线与卡片阴影，不加动画 ----------
+CUSTOM_CSS = """
+<style>
+  /* 主标题区渐变分隔线 */
+  .title-divider {
+    height: 3px;
+    border-radius: 3px;
+    margin: 6px 0 18px 0;
+    background: linear-gradient(90deg, #2563EB 0%, #60A5FA 55%, rgba(37,99,235,0) 100%);
+  }
+  /* 登录/注册卡片：圆角 + 浅阴影 */
+  .login-card {
+    background: #FFFFFF;
+    border: 1px solid #E5E7EB;
+    border-radius: 16px;
+    box-shadow: 0 2px 14px rgba(15, 23, 42, 0.06);
+    padding: 8px 24px 20px 24px;
+  }
+  /* 主要按钮圆角 */
+  .stButton > button, .stFormSubmitButton > button {
+    border-radius: 10px;
+  }
+  /* 侧边栏用户区：圆形头像 + 用户名 */
+  .user-chip { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
+  .avatar {
+    width: 34px; height: 34px; border-radius: 50%;
+    background: #2563EB; color: #FFFFFF;
+    display: flex; align-items: center; justify-content: center;
+    font-size: 15px; font-weight: 600; flex: none;
+  }
+  .user-name { font-size: 14px; font-weight: 600; color: #111827; }
+</style>
+"""
+st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
 
 
 # ---------- 会话状态初始化 ----------
-if "session_id" not in st.session_state:
-    new_session()
-if "doc_briefs" not in st.session_state:
+def _reset_chat_state():
+    """清空内存中与当前会话相关的状态（切换用户或新建会话时使用）。"""
+    st.session_state.session_id = None  # 数据库会话 ID，首次提问时才真正创建
+    st.session_state.session_title = "新会话"
+    st.session_state.messages = []
     st.session_state.doc_briefs = {}  # {文件名: {"summary":..., "questions":[...]}}
-if "pending_question" not in st.session_state:
     st.session_state.pending_question = None  # 点击推荐问题后待发送的问题
 
 
+if "user" not in st.session_state:
+    st.session_state.user = None  # {"id": int, "username": str}
+if "session_id" not in st.session_state:
+    _reset_chat_state()
+
+
+# ---------- 登录 / 注册页 ----------
+def render_auth_page():
+    """未登录时展示的居中登录/注册卡片。"""
+    left, mid, right = st.columns([1, 1.4, 1])
+    with mid:
+        st.markdown('<div class="title-divider"></div>', unsafe_allow_html=True)
+        st.markdown("## 📄 PDF 智能问答")
+        st.caption("上传 PDF → 自动摘要与推荐问题 → 流式问答，答案附带原文出处与相似度")
+        st.markdown('<div class="login-card">', unsafe_allow_html=True)
+
+        tab_login, tab_register = st.tabs(["登录", "注册"])
+        with tab_login:
+            render_login_form()
+        with tab_register:
+            render_register_form()
+
+        st.markdown("</div>", unsafe_allow_html=True)
+
+
+def render_login_form():
+    """登录表单：失败统一提示「用户名或密码不正确」。"""
+    with st.form("login_form"):
+        username = st.text_input("用户名", placeholder="3–20 位字母、数字或下划线")
+        password = st.text_input("密码", type="password")
+        submitted = st.form_submit_button("登录", use_container_width=True, type="primary")
+    if submitted:
+        try:
+            user = auth.login(username, password)
+        except Exception as e:
+            st.error(f"登录失败：{e}")
+            return
+        if user:
+            st.session_state.user = {"id": user["id"], "username": user["username"]}
+            _reset_chat_state()
+            st.rerun()
+        else:
+            st.error("用户名或密码不正确")
+
+
+def render_register_form():
+    """注册表单：校验用户名与密码规则，重名给出中文提示。"""
+    with st.form("register_form"):
+        username = st.text_input("设置用户名", placeholder="3–20 位字母、数字或下划线")
+        password = st.text_input("设置密码", type="password", help="至少 8 位")
+        password2 = st.text_input("确认密码", type="password")
+        submitted = st.form_submit_button("注册", use_container_width=True)
+    if submitted:
+        if password != password2:
+            st.error("两次输入的密码不一致。")
+            return
+        try:
+            result = auth.register(username, password)
+        except Exception as e:
+            st.error(f"注册失败：{e}")
+            return
+        if result["ok"]:
+            st.success("注册成功，请切换到「登录」页登录。")
+        else:
+            st.error(result["msg"])
+
+
+def render_sidebar_user():
+    """侧边栏顶部：当前用户的圆形头像、用户名与退出登录按钮。"""
+    user = st.session_state.user
+    with st.sidebar:
+        initial = (user["username"][0] if user["username"] else "?").upper()
+        st.markdown(
+            f'<div class="user-chip"><div class="avatar">{initial}</div>'
+            f'<span class="user-name">{user["username"]}</span></div>',
+            unsafe_allow_html=True,
+        )
+        if st.button("退出登录", use_container_width=True):
+            st.session_state.user = None
+            _reset_chat_state()
+            st.rerun()
+        st.divider()
+
+
+# 未登录：只显示登录/注册页（st.stop 阻断后面所有内容）
+if st.session_state.user is None:
+    render_auth_page()
+    st.stop()
+
+render_sidebar_user()
+
+USER_ID = st.session_state.user["id"]
+
+
+def _current_api_key() -> str:
+    """读取当前用户解密后的 DeepSeek Key；未设置返回空字符串。"""
+    try:
+        return auth.get_user_api_key(USER_ID)
+    except auth.AuthFriendlyError as e:
+        st.sidebar.warning(str(e))
+        return ""
+
+
+def _require_key_or_guide() -> str:
+    """
+    取当前用户的 Key；没填时给出引导提示并返回空字符串（不抛异常、不崩溃）。
+    """
+    key = _current_api_key()
+    if not key:
+        st.warning("还没有填写 DeepSeek API Key，请到「⚙️ 设置」页填写后再使用提问功能。")
+    return key
+
+
+# ---------- 通用组件 ----------
 def render_sources(sources: list[dict]):
     """折叠展示命中的原文片段及相似度分数。"""
     with st.expander("📚 命中原文片段与相似度"):
@@ -188,11 +234,91 @@ def render_sources(sources: list[dict]):
             st.progress(min(max(sim / 100.0, 0.0), 1.0))
 
 
+def save_current_session():
+    """把当前会话写回数据库（自动保存，只写自己的会话）。"""
+    if not st.session_state.session_id:
+        return
+    db.save_session(
+        USER_ID,
+        st.session_state.session_id,
+        st.session_state.messages,
+        title=st.session_state.session_title,
+    )
+
+
+# ---------- 页面一：💬 问答 ----------
+def page_chat():
+    """问答页：聊天窗口、流式回答、引用来源、摘要推荐问题、会话管理。"""
+    st.markdown('<div class="title-divider"></div>', unsafe_allow_html=True)
+
+    # 会话管理（数据来自数据库，只查当前用户的）
+    with st.sidebar:
+        st.subheader("💬 会话管理")
+        if st.button("➕ 新建会话", use_container_width=True):
+            _reset_chat_state()
+            st.rerun()
+
+        sessions = db.list_sessions(USER_ID)
+        if not sessions:
+            st.caption("暂无历史会话")
+        for s in sessions:
+            cols = st.columns([0.62, 0.19, 0.19])
+            flag = "✅ " if s["id"] == st.session_state.session_id else ""
+            cols[0].write(f"{flag}{s.get('title', '未命名会话')}")
+            if cols[1].button("加载", key=f"load_{s['id']}"):
+                loaded = db.get_session(USER_ID, s["id"])  # 再次校验归属，防越权
+                if loaded:
+                    st.session_state.session_id = loaded["id"]
+                    st.session_state.session_title = loaded["title"]
+                    st.session_state.messages = loaded["messages"]
+                    st.rerun()
+            if cols[2].button("删除", key=f"del_{s['id']}"):
+                db.delete_session(USER_ID, s["id"])  # 只能删自己的
+                if s["id"] == st.session_state.session_id:
+                    _reset_chat_state()
+                st.rerun()
+
+    # 主区：上次入库生成的摘要与推荐问题
+    for name, brief in st.session_state.doc_briefs.items():
+        with st.expander(f"📝 《{name}》全文摘要与推荐问题", expanded=False):
+            st.markdown(brief.get("summary", ""))
+            questions = brief.get("questions") or []
+            if questions:
+                st.markdown("**推荐问题（点击直接提问）**")
+                for i, q in enumerate(questions):
+                    if st.button(q, key=f"sug_{name}_{i}"):
+                        st.session_state.pending_question = q
+
+    st.subheader(f"💬 当前会话：{st.session_state.session_title}")
+
+    # 渲染历史消息（含引用来源）
+    for msg in st.session_state.messages:
+        with st.chat_message(msg["role"]):
+            st.markdown(msg["content"])
+            if msg.get("sources"):
+                render_sources(msg["sources"])
+
+    typed = st.chat_input("请输入你的问题…")
+    if typed:
+        handle_question(typed)
+
+    # 点击推荐问题提问（在同一轮运行中消费 pending_question）
+    if st.session_state.pending_question:
+        q = st.session_state.pending_question
+        st.session_state.pending_question = None
+        handle_question(q)
+
+
 def handle_question(question: str):
-    """处理一次提问：检索 → 流式生成 → 展示来源 → 自动保存会话。"""
-    # 首次提问时用问题内容给会话命名，方便历史列表辨认
-    if not st.session_state.messages:
+    """处理一次提问：取用户 Key → 检索 → 流式生成 → 展示来源 → 自动保存会话。"""
+    api_key = _require_key_or_guide()
+    if not api_key:
+        return
+
+    # 首次提问时才在数据库创建会话记录，并以前 20 字作为会话标题
+    if not st.session_state.session_id:
         st.session_state.session_title = question[:20]
+        st.session_state.session_id = db.create_session(USER_ID, st.session_state.session_title)
 
     st.session_state.messages.append({"role": "user", "content": question})
     with st.chat_message("user"):
@@ -201,11 +327,10 @@ def handle_question(question: str):
     contexts, answer = [], None
     with st.chat_message("assistant"):
         try:
-            contexts = similarity_search(question, top_k=4)
+            contexts = similarity_search(USER_ID, question, top_k=4)
             # write_stream 会逐段消费生成器，实现打字机效果
-            answer = st.write_stream(stream_answer(question, contexts))
+            answer = st.write_stream(stream_answer(question, contexts, api_key=api_key))
         except QAFriendlyError as e:
-            # 业务级错误（Key 缺失、API 失败等）：友好中文提示，不崩溃
             st.warning(str(e))
         except Exception as e:
             st.error(f"出现未预期的错误：{e}")
@@ -222,102 +347,145 @@ def handle_question(question: str):
     save_current_session()
 
 
-# ---------- 侧边栏 ----------
-with st.sidebar:
-    st.header("🔑 API Key")
-    if get_api_key():
-        st.success("已从 .env 读取 DEEPSEEK_API_KEY")
-    else:
-        st.error("未检测到 DEEPSEEK_API_KEY，请在项目根目录 .env 中配置")
+# ---------- 页面二：📁 我的文档 ----------
+def page_documents():
+    """文档页：多 PDF 上传入库（查重）、已入库列表、逐文档删除。"""
+    st.markdown('<div class="title-divider"></div>', unsafe_allow_html=True)
+    st.subheader("📁 我的文档")
+    st.caption("上传的 PDF 只会进入你自己的知识库，其他用户看不到。")
 
-    st.header("💬 会话管理")
-    if st.button("➕ 新建会话", use_container_width=True):
-        new_session()
-        st.rerun()
-
-    sessions = list_sessions()
-    if not sessions:
-        st.caption("暂无历史会话")
-    for s in sessions:
-        cols = st.columns([0.62, 0.19, 0.19])
-        flag = "✅ " if s.get("id") == st.session_state.session_id else ""
-        cols[0].write(f"{flag}{s.get('title', '未命名会话')}")
-        if cols[1].button("加载", key=f"load_{s.get('id')}"):
-            st.session_state.session_id = s.get("id")
-            st.session_state.session_title = s.get("title", "未命名会话")
-            st.session_state.session_created = s.get("created_at", _now_str())
-            st.session_state.messages = s.get("messages", [])
-            st.rerun()
-        if cols[2].button("删除", key=f"del_{s.get('id')}"):
-            delete_session(s.get("id"))
-            if s.get("id") == st.session_state.session_id:
-                new_session()
-            st.rerun()
-
-    st.divider()
-    st.header("📁 文档管理")
-    # 支持同时上传多个 PDF
     uploaded_files = st.file_uploader(
         "上传 PDF（可多选）", type=["pdf"], accept_multiple_files=True
     )
-    if uploaded_files and st.button("解析并入库", type="primary", use_container_width=True):
+    if uploaded_files and st.button("解析并入库", type="primary"):
+        api_key = _current_api_key()  # 摘要生成需要 Key，没有则跳过摘要
         for f in uploaded_files:
             with st.spinner(f"正在处理《{f.name}》…"):
-                if document_exists(f.name):
-                    st.info(f"《{f.name}》已入库，跳过。")
+                if document_exists(USER_ID, f.name):
+                    st.info(f"《{f.name}》已入库，跳过。如需重新处理，请先删除它。")
                     continue
                 try:
                     chunks = load_and_split_pdf(f)
                     if not chunks:
                         st.warning(f"《{f.name}》未提取到文本（可能是扫描件）。")
                         continue
-                    n = add_document(f.name, chunks)
+                    n = add_document(USER_ID, f.name, chunks)
                     st.success(f"《{f.name}》入库完成：{n} 个片段")
-                    # 入库后自动生成全文摘要 + 3 个推荐问题（只在该文档内检索）
+                except Exception as e:
+                    st.error(f"《{f.name}》入库失败：{e}")
+                    continue
+
+                # 入库后自动生成全文摘要 + 3 个推荐问题（只在该文档内检索）
+                if not api_key:
+                    st.info(f"《{f.name}》已入库；填写 API Key 后可自动生成摘要与推荐问题。")
+                    continue
+                try:
                     ctx = similarity_search(
+                        USER_ID,
                         "本文的主要内容、核心观点、结论与关键信息是什么",
                         top_k=6,
                         source=f.name,
                     )
-                    st.session_state.doc_briefs[f.name] = generate_doc_brief(f.name, ctx)
+                    st.session_state.doc_briefs[f.name] = generate_doc_brief(
+                        f.name, ctx, api_key=api_key
+                    )
                 except QAFriendlyError as e:
-                    st.warning(f"《{f.name}》：{e}")
+                    st.warning(f"《{f.name}》摘要生成失败：{e}")
                 except Exception as e:
-                    st.error(f"《{f.name}》处理失败：{e}")
+                    st.warning(f"《{f.name}》摘要生成失败：{e}")
 
-    docs = list_documents()
-    if docs:
-        st.caption("知识库：" + "、".join(docs))
+    st.divider()
+    docs = list_documents(USER_ID)
+    if not docs:
+        st.caption("知识库还是空的，先上传一个 PDF 吧。")
+        return
 
-# ---------- 主区域：文档摘要与推荐问题 ----------
-if st.session_state.doc_briefs:
-    for name, brief in st.session_state.doc_briefs.items():
-        with st.expander(f"📝 《{name}》全文摘要与推荐问题", expanded=False):
-            st.markdown(brief.get("summary", ""))
-            questions = brief.get("questions") or []
-            if questions:
-                st.markdown("**推荐问题（点击直接提问）**")
-                for i, q in enumerate(questions):
-                    if st.button(q, key=f"sug_{name}_{i}"):
-                        st.session_state.pending_question = q
+    st.markdown("**已入库文档**")
+    for name in docs:
+        cols = st.columns([0.72, 0.28])
+        cols[0].write(f"📄 {name}")
+        if cols[1].button("删除", key=f"del_doc_{name}"):
+            try:
+                removed = delete_document(USER_ID, name)
+                st.session_state.doc_briefs.pop(name, None)
+                st.success(
+                    f"已删除《{name}》（{removed} 个片段），可重新上传。"
+                    if removed
+                    else f"《{name}》已不存在。"
+                )
+                st.rerun()
+            except Exception as e:
+                st.error(f"删除失败：{e}")
 
-st.divider()
-st.subheader(f"💬 当前会话：{st.session_state.session_title}")
 
-# 渲染历史消息（含引用来源）
-for msg in st.session_state.messages:
-    with st.chat_message(msg["role"]):
-        st.markdown(msg["content"])
-        if msg.get("sources"):
-            render_sources(msg["sources"])
+# ---------- 页面三：⚙️ 设置 ----------
+def page_settings():
+    """设置页：账号信息、API Key 管理（加密 + 掩码）、修改密码。"""
+    st.markdown('<div class="title-divider"></div>', unsafe_allow_html=True)
+    st.subheader("⚙️ 设置")
 
-# 输入框提问
-typed = st.chat_input("请输入你的问题…")
-if typed:
-    handle_question(typed)
+    user = db.get_user_by_id(USER_ID) or {}
+    created = user.get("created_at")
+    created_str = created.strftime("%Y-%m-%d %H:%M") if created else "-"
 
-# 点击推荐问题提问（在同一轮运行中消费 pending_question）
-if st.session_state.pending_question:
-    q = st.session_state.pending_question
-    st.session_state.pending_question = None
-    handle_question(q)
+    st.markdown("**账号信息**")
+    info_cols = st.columns(2)
+    info_cols[0].text_input("用户名", value=st.session_state.user["username"], disabled=True)
+    info_cols[1].text_input("注册时间", value=created_str, disabled=True)
+
+    st.divider()
+    st.markdown("**DeepSeek API Key**")
+    current_key = _current_api_key()
+    st.code(auth.mask_key(current_key), language=None)
+    st.caption(
+        "Key 使用 Fernet 加密后保存，只有你自己能用。"
+        "申请地址：[platform.deepseek.com](https://platform.deepseek.com/)"
+    )
+
+    with st.form("api_key_form"):
+        new_key = st.text_input(
+            "填入新的 Key", type="password", placeholder="sk-...", help="保存后会覆盖旧 Key"
+        )
+        saved = st.form_submit_button("保存 Key", type="primary")
+    if saved:
+        try:
+            masked = auth.set_user_api_key(USER_ID, new_key)
+            st.success(f"Key 已加密保存（{masked}）")
+            st.rerun()
+        except auth.AuthFriendlyError as e:
+            st.error(str(e))
+
+    if current_key and st.button("删除已保存的 Key"):
+        auth.delete_user_api_key(USER_ID)
+        st.success("已删除保存的 Key，需要时可重新填写。")
+        st.rerun()
+
+    st.divider()
+    st.markdown("**修改密码**")
+    with st.form("password_form"):
+        old_password = st.text_input("当前密码", type="password")
+        new_password = st.text_input("新密码", type="password", help="至少 8 位")
+        confirm_password = st.text_input("确认新密码", type="password")
+        changed = st.form_submit_button("修改密码")
+    if changed:
+        if new_password != confirm_password:
+            st.error("两次输入的新密码不一致。")
+        else:
+            ok, msg = auth.change_password(USER_ID, old_password, new_password)
+            if ok:
+                st.success(msg)
+                st.session_state.user = None  # 修改成功后要求重新登录
+                _reset_chat_state()
+                st.rerun()
+            else:
+                st.error(msg)
+
+
+# ---------- 多页面导航 ----------
+PAGES = [
+    st.Page(page_chat, title="问答", icon="💬"),
+    st.Page(page_documents, title="我的文档", icon="📁"),
+    st.Page(page_settings, title="设置", icon="⚙️"),
+]
+navigation = st.navigation(PAGES)
+navigation.run()
