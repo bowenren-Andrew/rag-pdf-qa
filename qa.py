@@ -1,14 +1,17 @@
 # -*- coding: utf-8 -*-
 """
-qa.py（v3）
+qa.py（v3.1）
 职责：调用 DeepSeek API 生成回答（单一职责，不涉及界面与向量库）。
 - v3 变更：API Key **不再读全局环境变量**，改为由调用方传入（每位用户使用自己在
   「设置」页填写、经 Fernet 加密保存后解密出来的 Key）；
   仅保留 get_api_key() 作为本地开发/单元测试的兼容回退。
+- v3.1 变更：stream_answer / generate_answer 增加可选参数 history，支持多轮对话；
+  提示词改为「系统提示 → 对话历史 → 参考资料 → 当前问题」四段，
+  并明确历史只作背景参考、回答仍只依据本次参考资料。
 - 提供三种能力：
   1) generate_answer     —— 非流式回答（备用一次性调用）
   2) stream_answer       —— 流式回答（逐段 yield，供 st.write_stream 使用）
-  3) generate_doc_brief  —— 文档摘要 + 3 个推荐问题
+  3) generate_doc_brief  —— 文档摘要 + 3 个推荐问题（不传历史）
 - 所有失败都抛出 QAFriendlyError（中文友好提示），由界面层展示，程序不崩溃。
 """
 import json
@@ -64,16 +67,69 @@ def _require_client(api_key: str = None) -> OpenAI:
     return OpenAI(api_key=key, base_url=BASE_URL, timeout=60)
 
 
-def _build_prompt(question: str, contexts: list[dict]) -> str:
-    """把检索到的片段拼进提示词，要求模型仅依据资料回答并标注引用编号。"""
+# 多轮对话历史的字符上限：超出时从最旧的消息开始丢弃，最近一轮问答一定保留
+HISTORY_MAX_CHARS = 3000
+
+
+def truncate_history(history: list[dict], max_chars: int = HISTORY_MAX_CHARS) -> list[dict]:
+    """
+    按总字符数截断对话历史：从最旧的消息开始丢弃，但**最近一轮问答必定保留**。
+    :param history: [{"role": "user"/"assistant", "content": 文本}, ...]
+    :param max_chars: 总字符上限
+    :return: 截断后的历史（原顺序不变；空输入返回空列表）
+    """
+    msgs = [
+        m for m in (history or [])
+        if isinstance(m, dict) and m.get("role") in ("user", "assistant")
+    ]
+    if not msgs:
+        return []
+
+    def total(items: list[dict]) -> int:
+        return sum(len(str(m.get("content", ""))) for m in items)
+
+    if total(msgs) <= max_chars:
+        return msgs
+
+    # 最近一轮问答 = 最后两条消息（一问一答），无论如何都保留
+    keep_tail = 2 if len(msgs) >= 2 else 1
+    cut = 0
+    # 从最旧往新丢，直到总长度达标；cut 最多推进到只剩最近一轮
+    while cut + keep_tail < len(msgs) and total(msgs[cut:]) > max_chars:
+        cut += 1
+    return msgs[cut:]
+
+
+def _build_prompt(question: str, contexts: list[dict], history: list[dict] = None) -> str:
+    """
+    拼装提示词，结构为四段：
+    1) 系统提示（严谨问答助手 + 只依据本次资料回答）
+    2) 对话历史（可选，按时间顺序「用户：… / 助手：…」）
+    3) 本次检索到的参考资料（保持【资料N】格式与引用编号要求）
+    4) 当前问题
+    """
+    system_part = (
+        "你是一个严谨的文档问答助手。请只根据下面的参考资料回答用户问题，"
+        "并在回答中标注引用的资料编号（如【资料1】）。"
+        "历史对话只作背景参考，回答内容仍必须只依据本次检索到的参考资料；"
+        "如果本次参考资料无法回答问题，请明确说明“根据现有资料无法回答”，"
+        "不要用历史内容编造。"
+    )
+    history_part = ""
+    if history:
+        lines = [
+            f"{'用户' if m.get('role') == 'user' else '助手'}：{m.get('content', '')}"
+            for m in history
+        ]
+        history_part = "对话历史：\n" + "\n".join(lines) + "\n\n"
+
     parts = []
     for i, c in enumerate(contexts, start=1):
         parts.append(f"【资料{i}】（来源：{c['source']}，第{c['page']}页）\n{c['text']}")
     refs = "\n\n".join(parts)
     return (
-        "你是一个严谨的 PDF 问答助手。请只根据下面的参考资料回答用户问题，"
-        "并在回答中标注引用的资料编号（如【资料1】）。"
-        "如果参考资料无法回答问题，请明确说明“根据现有资料无法回答”，不要编造内容。\n\n"
+        f"{system_part}\n\n"
+        f"{history_part}"
         f"参考资料：\n{refs}\n\n用户问题：{question}\n\n回答："
     )
 
@@ -93,17 +149,28 @@ def _friendly(e: Exception) -> QAFriendlyError:
     return QAFriendlyError(f"调用 DeepSeek API 失败：{e}")
 
 
-def generate_answer(question: str, contexts: list[dict], api_key: str = None) -> str:
-    """非流式生成回答（一次性返回完整文本，备用）。"""
+def generate_answer(
+    question: str,
+    contexts: list[dict],
+    history: list[dict] = None,
+    api_key: str = None,
+) -> str:
+    """
+    非流式生成回答（一次性返回完整文本，备用）。
+    :param history: 可选，多轮对话历史 [{"role","content"}, ...]，内部会先做截断保护
+    """
     client = _require_client(api_key)
     if not contexts:
-        raise QAFriendlyError("没有检索到相关内容，请先上传并成功解析 PDF 文件。")
+        raise QAFriendlyError("没有检索到相关内容，请先上传并成功解析文档。")
     try:
         resp = client.chat.completions.create(
             model=MODEL,
             messages=[
                 {"role": "system", "content": "你是一个严谨的 PDF 问答助手，回答使用简体中文。"},
-                {"role": "user", "content": _build_prompt(question, contexts)},
+                {
+                    "role": "user",
+                    "content": _build_prompt(question, contexts, truncate_history(history)),
+                },
             ],
             temperature=0.3,
         )
@@ -113,18 +180,27 @@ def generate_answer(question: str, contexts: list[dict], api_key: str = None) ->
 
 
 def stream_answer(
-    question: str, contexts: list[dict], api_key: str = None
+    question: str,
+    contexts: list[dict],
+    history: list[dict] = None,
+    api_key: str = None,
 ) -> Iterator[str]:
-    """流式生成回答：逐段 yield 文本，配合 st.write_stream 实现打字机效果。"""
+    """
+    流式生成回答：逐段 yield 文本，配合 st.write_stream 实现打字机效果。
+    :param history: 可选，多轮对话历史 [{"role","content"}, ...]，内部会先做截断保护
+    """
     client = _require_client(api_key)
     if not contexts:
-        raise QAFriendlyError("没有检索到相关内容，请先上传并成功解析 PDF 文件。")
+        raise QAFriendlyError("没有检索到相关内容，请先上传并成功解析文档。")
     try:
         stream = client.chat.completions.create(
             model=MODEL,
             messages=[
                 {"role": "system", "content": "你是一个严谨的 PDF 问答助手，回答使用简体中文。"},
-                {"role": "user", "content": _build_prompt(question, contexts)},
+                {
+                    "role": "user",
+                    "content": _build_prompt(question, contexts, truncate_history(history)),
+                },
             ],
             temperature=0.3,
             stream=True,

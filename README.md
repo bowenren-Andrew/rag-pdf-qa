@@ -34,10 +34,30 @@
 - **会话管理**：新建 / 加载 / 删除历史会话，每轮问答自动保存到数据库（本地 sqlite 或云端 Postgres）
 - **中文向量检索**：`BAAI/bge-small-zh-v1.5`，检索 query 自动加 BGE 官方指令前缀
 - **三页面结构（v3）**：💬 问答 / 📁 我的文档 / ⚙️ 设置，用 `st.navigation` 组织
+- **多轮对话上下文（v3.1）**：追问时自动带上本会话的历史（按字符数截断，最近一轮必留），历史只作背景，回答仍只依据本次检索到的资料
+- **支持 PPTX（v3.1）**：除 PDF 外可直接上传 PowerPoint，逐张幻灯片提取文本（含表格单元格）
 
 ---
 
-## 三、功能截图
+## 三、支持的文件类型
+
+| 类型 | 解析方式 | 来源展示 |
+| --- | --- | --- |
+| **PDF（文本版）** | PyPDF2 逐页提取文本 → 清洗 → 约 500 字切分 | 第 X 页 |
+| **PDF（扫描件 / 图片页）** | 无文本页自动 OCR：PyMuPDF 2 倍渲染 + RapidOCR 识别 | 第 X 页 |
+| **PPTX** | python-pptx 逐张幻灯片提取文本（含表格单元格），复用同一套清洗与切分 | 第 X 张 |
+
+**关于 OCR 兜底**
+
+- 触发条件很克制：**只有**某页提取不到文本（清洗后少于 10 字）时才走 OCR，有正常文本的页一律不触发，普通 PDF 的速度不受影响。
+- 识别引擎**懒加载**：不上传扫描件就完全不加载，不占用内存。
+- 模型随 `rapidocr-onnxruntime` 包内置，**运行时不需要联网下载**；单页识别约 1–3 秒。
+- 某一页 OCR 失败不会中断整个文件入库，界面会列出被跳过的页码，例如「第 3、5 页为图片且识别失败，已跳过」。
+- 云端注意：这三个新依赖合计约 **165MB**（pymupdf 105M + onnxruntime 43M + rapidocr 14M），首次构建时间会变长；若免费版内存吃紧，可从 `requirements.txt` 删除 `pymupdf` 与 `rapidocr-onnxruntime`，OCR 会自动降级为"跳过图片页"并给出提示，其余功能不受影响。
+
+---
+
+## 四、功能截图
 
 > ⚠️ 截图待补充：启动应用后按下面场景截图，覆盖 `docs/screenshots/` 中同名文件即可（建议宽度 1200px 左右）。
 
@@ -50,14 +70,15 @@
 
 ---
 
-## 四、技术架构
+## 五、技术架构
 
 ### 4.1 技术栈
 
 | 层次 | 选型 | 说明 |
 | --- | --- | --- |
 | 界面 | Streamlit | 纯 Python 写 Web UI，无需前端代码 |
-| PDF 解析 | PyPDF2 | 逐页提取文本并清洗 |
+| 文档解析 | PyPDF2 + python-pptx + PyMuPDF | PDF 逐页提取、PPTX 逐张幻灯片提取；扫描件页渲染后 OCR |
+| OCR | rapidocr-onnxruntime（RapidOCR） | 中文识别，模型随包内置，懒加载 |
 | 向量模型 | sentence-transformers · `BAAI/bge-small-zh-v1.5` | 中文语义向量，约 100MB，输出 512 维 |
 | 向量库 | Chroma（`PersistentClient`） | 每个用户一个 collection，余弦距离检索 |
 | 大模型 | DeepSeek（`deepseek-chat`） | OpenAI 兼容 SDK，支持流式 |
@@ -70,9 +91,9 @@
 | 文件 | 职责 | 关键接口 |
 | --- | --- | --- |
 | `app.py` | 界面与交互：登录注册、三页导航、流式聊天、来源展示 | `render_auth_page()` / `page_chat()` / `page_documents()` / `page_settings()` |
-| `loader.py` | PDF 文本提取与切分（v3 未改动） | `load_and_split_pdf(file)` → `[{text, page}]` |
-| `vectorstore.py` | 向量化与相似检索（按用户隔离） | `add_document(user_id, ...)` / `similarity_search(user_id, ...)` / `delete_document(user_id, ...)` |
-| `qa.py` | 调用 DeepSeek 生成回答（Key 由调用方传入） | `stream_answer(q, ctx, api_key=)` / `generate_doc_brief(...)` |
+| `loader.py` | PDF / PPTX 文本提取与切分（v3.1：新增 PPTX 与 OCR 兜底） | `load_and_split_pdf(file, ocr_report=)` / `load_and_split_pptx(file)` / `load_and_split_file(file, name)` → `[{text, page}]` |
+| `vectorstore.py` | 向量化与相似检索（按用户隔离，元数据含 `doc_type`） | `add_document(user_id, ...)` / `similarity_search(user_id, ...)` / `delete_document(user_id, ...)` |
+| `qa.py` | 调用 DeepSeek 生成回答（Key 由调用方传入，v3.1 支持 history） | `stream_answer(q, ctx, history=, api_key=)` / `truncate_history()` / `generate_doc_brief(...)` |
 | `db.py` | v3 新增：表定义与数据读写 | `init_db()` / `create_session()` / `list_sessions(user_id)` / `save_session()` / `delete_session()` |
 | `auth.py` | v3 新增：账号体系与密钥安全 | `register()` / `login()` / `hash_password()` / `encrypt_key()` / `mask_key()` |
 
@@ -107,7 +128,7 @@ flowchart TD
 
 ---
 
-## 五、本地运行步骤
+## 六、本地运行步骤
 
 ### 1. 准备环境
 
@@ -172,7 +193,7 @@ streamlit run app.py
 
 ---
 
-## 六、Streamlit Cloud 部署步骤
+## 七、Streamlit Cloud 部署步骤
 
 ### 1. 推送代码到 GitHub
 
@@ -219,7 +240,7 @@ APP_SECRET_KEY = "你的Fernet密钥"
 
 ---
 
-## 七、云端部署需要配置的 Secrets
+## 八、云端部署需要配置的 Secrets
 
 v3 需要两个环境变量，缺一个应用就起不来：
 
@@ -264,14 +285,14 @@ DATABASE_URL = "postgresql://postgres.xxxx:你的密码@aws-0-ap-southeast-1.poo
 
 ---
 
-## 八、目录结构
+## 九、目录结构
 
 ```
 pdf_qa_app/
 ├── app.py                     # Streamlit 界面（登录 + 问答 / 我的文档 / 设置 三页）
-├── loader.py                  # PDF 解析与文本切分（v3 未改动）
+├── loader.py                  # PDF / PPTX 解析与文本切分（v3.1：+PPTX、+OCR 兜底）
 ├── vectorstore.py             # 向量化与检索（v3：按 user_id 隔离 collection）
-├── qa.py                      # DeepSeek 调用（v3：Key 由调用方传入）
+├── qa.py                      # DeepSeek 调用（v3：Key 由调用方传入；v3.1：多轮 history）
 ├── auth.py                    # v3 新增：注册登录、密码哈希、Key 加解密与掩码
 ├── db.py                      # v3 新增：SQLAlchemy 数据访问（users / sessions 表）
 ├── requirements.txt           # 依赖清单
@@ -281,6 +302,7 @@ pdf_qa_app/
 ├── .streamlit/config.toml     # v3 新增：界面主题（深蓝主色 / 白色卡片 / 浅灰侧栏）
 ├── 修改说明_v2.md              # v1 → v2 改动说明
 ├── 修改说明_v3.md              # v2 → v3 改动说明
+├── 修改说明_v3.1.md            # v3 → v3.1 改动说明
 ├── chroma_db/                 # 向量库（运行时生成，不提交）
 ├── app.db                     # 本地 sqlite（不配 DATABASE_URL 时自动生成，不提交）
 └── tests/                     # 单元测试
@@ -288,12 +310,15 @@ pdf_qa_app/
     ├── test_loader.py         # 文本切分（15 例）
     ├── test_qa.py             # JSON 解析与错误处理（13 例）
     ├── test_auth.py           # v3 新增：密码哈希 / Key 加解密 / 掩码（16 例）
-    └── test_sessions_isolation.py  # v3 新增：会话隔离与越权防护（6 例）
+    ├── test_sessions_isolation.py  # v3 新增：会话隔离与越权防护（6 例）
+    ├── test_pptx.py           # v3.1 新增：PPTX 解析与按后缀分发（8 例）
+    ├── test_multiturn.py      # v3.1 新增：历史截断与四段提示词（12 例）
+    └── test_ocr_fallback.py   # v3.1 新增：OCR 兜底与降级（8 例，含 1 例默认跳过）
 ```
 
 ---
 
-## 九、运行测试
+## 十、运行测试
 
 测试全部使用假数据（mock），**不会调用真实 DeepSeek API、不会下载向量模型**。
 
@@ -310,7 +335,7 @@ pytest tests/test_qa.py -k JSON      # 只跑名字含 JSON 的用例
 
 当前用例：28 个，覆盖 `loader.py` 的文本清洗/切句/重叠切分/硬切兜底，以及 `qa.py` 的 JSON 解析（含代码块围栏、非法 JSON 降级）、错误处理（缺 Key / 401 / 网络失败）与流式输出拼接。
 
-## 十、常见问题
+## 十一、常见问题
 
 **Q：提示"未检测到 API Key"？**
 A：确认 `.env` 与 `app.py` 同级、文件名为 `.env`（不是 `.env.txt`）、内容格式为 `DEEPSEEK_API_KEY=sk-xxx`，改完后重启应用。

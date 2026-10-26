@@ -1,12 +1,16 @@
 # -*- coding: utf-8 -*-
 """
-app.py（v3）
+app.py（v3.1）
 职责：Streamlit 界面（单一职责：只做交互与展示，业务逻辑在 auth/db/loader/vectorstore/qa）。
 - v3 变更：新增账号体系（注册/登录）、session_state 保存当前用户；
           知识库与会话按 user_id 隔离；每位用户使用自己的 DeepSeek Key。
+- v3.1 变更：问答支持多轮对话上下文（history 传入 qa 层）；
+          文档页支持 PDF 与 PPTX 上传（按后缀分发解析）；
+          图片型 PDF 走 OCR 兜底，识别失败的页码用一条提示列出；
+          来源展示按类型区分「第 X 页」/「第 X 张」。
 - 页面结构（st.navigation 多页面）：
   1) 💬 问答      —— 聊天、流式回答、引用原文与相似度、文档摘要与推荐问题、会话管理
-  2) 📁 我的文档  —— 上传 PDF 入库（查重）、已入库列表与删除
+  2) 📁 我的文档  —— 上传 PDF / PPTX 入库（查重）、已入库列表与删除
   3) ⚙️ 设置      —— 账号信息、API Key 管理（加密存储 + 掩码显示）、修改密码
 会话数据存放在数据库（见 db.py），不再使用本地 JSON 文件。
 运行方式：streamlit run app.py
@@ -17,7 +21,7 @@ import streamlit as st
 
 import auth
 import db
-from loader import load_and_split_pdf
+from loader import load_and_split_file
 from qa import QAFriendlyError, generate_doc_brief, stream_answer
 from vectorstore import (
     add_document,
@@ -222,13 +226,14 @@ def _require_key_or_guide() -> str:
 
 # ---------- 通用组件 ----------
 def render_sources(sources: list[dict]):
-    """折叠展示命中的原文片段及相似度分数。"""
+    """折叠展示命中的原文片段及相似度分数（PDF 用「页」，PPTX 用「张」）。"""
     with st.expander("📚 命中原文片段与相似度"):
         for i, s in enumerate(sources, start=1):
             # Chroma 返回的是余弦距离（越小越相似），换算成百分比相似度展示
             sim = max(0.0, 1.0 - float(s["score"])) * 100
+            unit = "张" if s.get("doc_type") == "pptx" else "页"
             st.markdown(
-                f"**【片段{i}】** {s['source']} · 第 {s['page']} 页 · 相似度 **{sim:.1f}%**"
+                f"**【片段{i}】** {s['source']} · 第 {s['page']} {unit} · 相似度 **{sim:.1f}%**"
             )
             st.caption(s["text"])
             st.progress(min(max(sim / 100.0, 0.0), 1.0))
@@ -309,8 +314,20 @@ def page_chat():
         handle_question(q)
 
 
+def _build_history() -> list[dict]:
+    """
+    整理多轮对话上下文：只保留 role 与 content 两个字段，去掉 sources 等额外字段。
+    注意：必须在把本轮新问题追加进 messages **之前**调用，避免问题被重复计入历史。
+    """
+    return [
+        {"role": m.get("role", "user"), "content": m.get("content", "")}
+        for m in st.session_state.get("messages", [])
+        if m.get("role") in ("user", "assistant")
+    ]
+
+
 def handle_question(question: str):
-    """处理一次提问：取用户 Key → 检索 → 流式生成 → 展示来源 → 自动保存会话。"""
+    """处理一次提问：取用户 Key → 检索 → 带历史流式生成 → 展示来源 → 自动保存会话。"""
     api_key = _require_key_or_guide()
     if not api_key:
         return
@@ -320,6 +337,8 @@ def handle_question(question: str):
         st.session_state.session_title = question[:20]
         st.session_state.session_id = db.create_session(USER_ID, st.session_state.session_title)
 
+    # 先取历史（此时 messages 里还没有本轮问题），再把本轮问题追加进去
+    history = _build_history()
     st.session_state.messages.append({"role": "user", "content": question})
     with st.chat_message("user"):
         st.markdown(question)
@@ -329,7 +348,9 @@ def handle_question(question: str):
         try:
             contexts = similarity_search(USER_ID, question, top_k=4)
             # write_stream 会逐段消费生成器，实现打字机效果
-            answer = st.write_stream(stream_answer(question, contexts, api_key=api_key))
+            answer = st.write_stream(
+                stream_answer(question, contexts, history=history, api_key=api_key)
+            )
         except QAFriendlyError as e:
             st.warning(str(e))
         except Exception as e:
@@ -349,13 +370,16 @@ def handle_question(question: str):
 
 # ---------- 页面二：📁 我的文档 ----------
 def page_documents():
-    """文档页：多 PDF 上传入库（查重）、已入库列表、逐文档删除。"""
+    """文档页：多文件上传入库（PDF / PPTX，查重）、已入库列表、逐文档删除。"""
     st.markdown('<div class="title-divider"></div>', unsafe_allow_html=True)
     st.subheader("📁 我的文档")
-    st.caption("上传的 PDF 只会进入你自己的知识库，其他用户看不到。")
+    st.caption(
+        "支持 PDF（含扫描件，图片页会自动 OCR 识别）与 PPTX；"
+        "上传的文档只会进入你自己的知识库，其他用户看不到。"
+    )
 
     uploaded_files = st.file_uploader(
-        "上传 PDF（可多选）", type=["pdf"], accept_multiple_files=True
+        "上传 PDF 或 PPTX（可多选）", type=["pdf", "pptx"], accept_multiple_files=True
     )
     if uploaded_files and st.button("解析并入库", type="primary"):
         api_key = _current_api_key()  # 摘要生成需要 Key，没有则跳过摘要
@@ -365,10 +389,33 @@ def page_documents():
                     st.info(f"《{f.name}》已入库，跳过。如需重新处理，请先删除它。")
                     continue
                 try:
-                    chunks = load_and_split_pdf(f)
-                    if not chunks:
-                        st.warning(f"《{f.name}》未提取到文本（可能是扫描件）。")
-                        continue
+                    # 按后缀分发解析；OCR 情况写进 report，供下方提示使用
+                    ocr_report = {}
+                    chunks = load_and_split_file(f, f.name, ocr_report=ocr_report)
+                except ValueError as e:
+                    st.warning(str(e))
+                    continue
+                except Exception as e:
+                    st.error(f"《{f.name}》解析失败：{e}")
+                    continue
+
+                if not chunks:
+                    # 只有全文完全没有可用文本时才这样提示（单个图片页失败另有提示）
+                    st.warning(f"《{f.name}》未提取到任何可用文本，已跳过。")
+                    continue
+
+                # OCR 结果提示：识别成功的页与识别失败被跳过的页
+                if ocr_report.get("ocr_pages"):
+                    st.info(
+                        f"《{f.name}》有 {len(ocr_report['ocr_pages'])} 个图片页已通过 OCR 识别入库。"
+                    )
+                if ocr_report.get("ocr_failed"):
+                    pages = "、".join(str(p) for p in ocr_report["ocr_failed"])
+                    st.warning(f"第 {pages} 页为图片且识别失败，已跳过。")
+                if ocr_report.get("ocr_error") and not ocr_report.get("ocr_pages"):
+                    st.warning(f"OCR 未启用（{ocr_report['ocr_error']}），图片页内容可能被跳过。")
+
+                try:
                     n = add_document(USER_ID, f.name, chunks)
                     st.success(f"《{f.name}》入库完成：{n} 个片段")
                 except Exception as e:
@@ -403,7 +450,8 @@ def page_documents():
     st.markdown("**已入库文档**")
     for name in docs:
         cols = st.columns([0.72, 0.28])
-        cols[0].write(f"📄 {name}")
+        icon = "📊" if name.lower().endswith(".pptx") else "📄"
+        cols[0].write(f"{icon} {name}")
         if cols[1].button("删除", key=f"del_doc_{name}"):
             try:
                 removed = delete_document(USER_ID, name)

@@ -70,10 +70,16 @@ def list_documents(user_id: int) -> list[str]:
     return sorted(s for s in sources if s)
 
 
+def _doc_type(filename: str) -> str:
+    """按文件名后缀判断文档类型（pdf / pptx），用于来源展示时区分「页」与「张」。"""
+    ext = os.path.splitext(filename or "")[1].lower().lstrip(".")
+    return "pptx" if ext == "pptx" else "pdf"
+
+
 def add_document(user_id: int, filename: str, chunks: list[dict]) -> int:
     """
-    把一个 PDF 的文本片段向量化并写入当前用户的集合。
-    :param chunks: loader.load_and_split_pdf 的返回结果
+    把一个文档（PDF 或 PPTX）的文本片段向量化并写入当前用户的集合。
+    :param chunks: loader.load_and_split_pdf / load_and_split_pptx 的返回结果
     :return: 实际写入的片段条数
     """
     if not chunks:
@@ -82,7 +88,10 @@ def add_document(user_id: int, filename: str, chunks: list[dict]) -> int:
     texts = [c["text"] for c in chunks]
     embeddings = model.encode(texts, normalize_embeddings=True).tolist()
     ids = [f"{filename}::p{c['page']}::{i}" for i, c in enumerate(chunks)]
-    metadatas = [{"source": filename, "page": c["page"]} for c in chunks]
+    doc_type = _doc_type(filename)
+    metadatas = [
+        {"source": filename, "page": c["page"], "doc_type": doc_type} for c in chunks
+    ]
     _get_collection(user_id).add(
         ids=ids, embeddings=embeddings, documents=texts, metadatas=metadatas
     )
@@ -95,8 +104,8 @@ def similarity_search(
     """
     在当前用户的知识库内做相似检索。
     :param source: 可选，限定只在某个文档内检索（传文件名）
-    :return: [{"text","source","page","score"}]，score 为余弦距离，越小越相似
-             （界面展示的相似度 = 1 - score）
+    :return: [{"text","source","page","doc_type","score"}]，score 为余弦距离，越小越相似
+             （界面展示的相似度 = 1 - score；doc_type 为 pdf / pptx）
     """
     model = _get_model()
     query_vec = model.encode(
@@ -111,7 +120,14 @@ def similarity_search(
         result["documents"][0], result["metadatas"][0], result["distances"][0]
     ):
         hits.append(
-            {"text": doc, "source": meta["source"], "page": meta["page"], "score": dist}
+            {
+                "text": doc,
+                "source": meta["source"],
+                "page": meta["page"],
+                # 旧数据可能没有该字段，默认按 pdf 展示
+                "doc_type": meta.get("doc_type") or _doc_type(meta.get("source", "")),
+                "score": dist,
+            }
         )
     return hits
 
