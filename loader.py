@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-loader.py（v3.1）
+loader.py（v3.2）
 职责：读取 PDF / PPTX 并切分文本片段（单一职责，不涉及向量化和问答）。
 - PDF：PyPDF2 逐页提取文本；无文本页（扫描件、图片页）自动走 PyMuPDF + RapidOCR 兜底；
 - PPTX：python-pptx 逐张幻灯片提取文本（含表格单元格文本）；
@@ -9,6 +9,8 @@ loader.py（v3.1）
 - 单句超过 500 字时，退化为字符滑动窗口硬切兜底。
 
 v3.1 新增：load_and_split_pptx、load_and_split_file（按后缀分发）、无文本页 OCR 兜底。
+v3.2 新增：force_ocr 参数——针对 LaTeX 导出的公式类 PDF（有文本层但公式位置为空、
+整页字数远超阈值）提供"强制全文 OCR"开关；不勾选时行为与 v3.1 完全一致。
 """
 import io
 import os
@@ -165,19 +167,23 @@ def _render_pdf_page_png(data: bytes, page_no: int, zoom: float = OCR_ZOOM) -> b
 
 
 def load_and_split_pdf(
-    file: Union[str, IO[bytes]], ocr_report: dict = None
+    file: Union[str, IO[bytes]], ocr_report: dict = None, force_ocr: bool = False
 ) -> list[dict]:
     """
     读取 PDF 并切分文本；无文本页（扫描件、图片页）自动走 OCR 兜底。
     :param file: PDF 文件路径，或类文件对象（如 Streamlit 的 UploadedFile）
     :param ocr_report: 可选，传入一个空 dict，函数会把 OCR 情况写进去：
                        {"ocr_pages": [走过OCR的页码], "ocr_failed": [OCR仍失败的页码],
-                        "ocr_error": "引擎不可用的原因"}
+                        "ocr_error": "引擎不可用的原因", "ocr_mode": "auto"/"force"}
+    :param force_ocr: True 时忽略文本层、对每一页都渲染成图片走 OCR。
+                      适用于 LaTeX 导出的公式类 PDF——这类文件有文本层（整页字数不少），
+                      但公式符号没有文本映射、提取后公式位置为空白，常规兜底不会触发。
+                      单页 OCR 失败会回退到该页提取到的文本，失败绝不中断整文件。
     :return: [{"text": 片段文本, "page": 页码(从1开始)}, ...]
     """
     reader = PdfReader(file)
     results = []
-    pending_ocr = []  # 无文本页：先记下页码，稍后统一 OCR
+    pending_ocr = []  # 待 OCR 的页：(页码, 该页原本提取到的文本，用作失败回退)
 
     def _append(page_no: int, text: str):
         """把一页文本切分后追加进结果（空文本直接跳过）。"""
@@ -188,11 +194,15 @@ def load_and_split_pdf(
 
     for page_no, page in enumerate(reader.pages, start=1):
         cleaned = _clean_text(page.extract_text() or "")
-        if len(cleaned) < MIN_TEXT_LEN:
+        if force_ocr:
+            # 强制模式：每一页都送进 OCR，提取到的文本只留作失败回退
+            pending_ocr.append((page_no, cleaned))
+        elif len(cleaned) < MIN_TEXT_LEN:
+            # 自动模式：只有"无文本页"才 OCR；
             # 记录页码与"原本那点文本"：OCR 失败时还能退回用它，不把已有内容弄丢
             pending_ocr.append((page_no, cleaned))
-            continue
-        _append(page_no, cleaned)
+        else:
+            _append(page_no, cleaned)
 
     ocr_pages, ocr_failed = [], []
     if pending_ocr:
@@ -235,6 +245,8 @@ def load_and_split_pdf(
     if ocr_report is not None:
         ocr_report["ocr_pages"] = ocr_pages
         ocr_report["ocr_failed"] = ocr_failed
+        # 供界面区分两种模式：auto=只 OCR 无文本页，force=全文强制 OCR
+        ocr_report["ocr_mode"] = "force" if force_ocr else "auto"
 
     # OCR 的页是后追加的，按页码重新排一次，保证输出顺序与原文一致
     results.sort(key=lambda c: c["page"])
@@ -302,17 +314,21 @@ def load_and_split_pptx(file: Union[str, IO[bytes]]) -> list[dict]:
 
 
 def load_and_split_file(
-    file: Union[str, IO[bytes]], filename: str, ocr_report: dict = None
+    file: Union[str, IO[bytes]],
+    filename: str,
+    ocr_report: dict = None,
+    force_ocr: bool = False,
 ) -> list[dict]:
     """
     按文件后缀分发解析器（PDF 走 PDF 解析，PPTX 走 PPTX 解析）。
     :param filename: 原始文件名，仅用于判断后缀
     :param ocr_report: 仅 PDF 使用，见 load_and_split_pdf 的说明
+    :param force_ocr: 仅 PDF 使用，True 时全文强制 OCR（PPTX 本身有文本结构，忽略该参数）
     :raises ValueError: 遇到不支持的后缀
     """
     ext = os.path.splitext(filename or "")[1].lower().lstrip(".")
     if ext == "pdf":
-        return load_and_split_pdf(file, ocr_report=ocr_report)
+        return load_and_split_pdf(file, ocr_report=ocr_report, force_ocr=force_ocr)
     if ext == "pptx":
         return load_and_split_pptx(file)
     raise ValueError(f"不支持的文件类型：.{ext or '未知'}（目前支持 pdf / pptx）")

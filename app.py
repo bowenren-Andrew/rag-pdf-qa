@@ -381,6 +381,20 @@ def page_documents():
     uploaded_files = st.file_uploader(
         "上传 PDF 或 PPTX（可多选）", type=["pdf", "pptx"], accept_multiple_files=True
     )
+
+    # 强制全文 OCR 开关：默认关闭，勾选后对 PDF 的每一页都做 OCR（对 PPTX 无效）
+    force_ocr = False
+    if uploaded_files:
+        force_ocr = st.checkbox(
+            "该文件含大量数学公式或扫描质量差，强制全文 OCR（较慢、更占内存，大文件慎用）",
+            value=False,
+            help=(
+                "适用于 LaTeX 导出的课件/作业：这类 PDF 能提取到文字，但公式位置是空白，"
+                "常规规则（整页少于 10 字才 OCR）不会触发。勾选后忽略文本层、逐页识别，"
+                "普通 PDF 请不要勾选。仅对 PDF 生效。"
+            ),
+        )
+
     if uploaded_files and st.button("解析并入库", type="primary"):
         api_key = _current_api_key()  # 摘要生成需要 Key，没有则跳过摘要
         for f in uploaded_files:
@@ -391,7 +405,9 @@ def page_documents():
                 try:
                     # 按后缀分发解析；OCR 情况写进 report，供下方提示使用
                     ocr_report = {}
-                    chunks = load_and_split_file(f, f.name, ocr_report=ocr_report)
+                    chunks = load_and_split_file(
+                        f, f.name, ocr_report=ocr_report, force_ocr=force_ocr
+                    )
                 except ValueError as e:
                     st.warning(str(e))
                     continue
@@ -406,9 +422,15 @@ def page_documents():
 
                 # OCR 结果提示：识别成功的页与识别失败被跳过的页
                 if ocr_report.get("ocr_pages"):
-                    st.info(
-                        f"《{f.name}》有 {len(ocr_report['ocr_pages'])} 个图片页已通过 OCR 识别入库。"
-                    )
+                    if ocr_report.get("ocr_mode") == "force":
+                        st.info(
+                            f"《{f.name}》已强制全文 OCR，"
+                            f"共 {len(ocr_report['ocr_pages'])} 页通过识别入库。"
+                        )
+                    else:
+                        st.info(
+                            f"《{f.name}》有 {len(ocr_report['ocr_pages'])} 个图片页已通过 OCR 识别入库。"
+                        )
                 if ocr_report.get("ocr_failed"):
                     pages = "、".join(str(p) for p in ocr_report["ocr_failed"])
                     st.warning(f"第 {pages} 页为图片且识别失败，已跳过。")
