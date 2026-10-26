@@ -238,7 +238,19 @@ v3 需要两个环境变量，缺一个应用就起不来：
 3. 项目创建完成后，左下角 **Project Settings** → **Database**
 4. 在 **Connection string** 区切换到 **URI** 标签，复制那串 `postgresql://postgres.xxxx:[YOUR-PASSWORD]@...` 的链接
 5. 把链接里的 `[YOUR-PASSWORD]` 换成你在第 2 步设置的密码
-6. 粘贴到 Streamlit Cloud 的 Secrets：
+6. **如果 Supabase 给你的是下面这种 `.env` 模板，不能直接照抄**（这是给 Prisma 用的）：
+
+   ```ini
+   DATABASE_URL="postgresql://postgres.xxxx:[YOUR-PASSWORD]@//aws-0-ap-northeast-1.pooler.supabase.com/:6543/postgres?pgbouncer=true"
+   DIRECT_URL="postgresql://postgres.xxxx:[YOUR-PASSWORD]@//aws-0-ap-northeast-1.pooler.supabase.com/:5432/postgres"
+   ```
+
+   改法三条：
+   - **用 `DIRECT_URL` 那一行（端口 5432，session 模式）**，不要用 6543 的事务模式 pooler；本项目用 SQLAlchemy 建表 + 会话级查询，事务模式容易出现预编译语句兼容问题
+   - **删掉主机名前后的 `//` 和 `/`**，写成 `...@aws-0-ap-northeast-1.pooler.supabase.com:5432/postgres`
+   - **不需要 `DIRECT_URL`**，本项目只认 `DATABASE_URL` 一个变量
+
+7. 粘贴到 Streamlit Cloud 的 Secrets：
 
 ```toml
 DATABASE_URL = "postgresql://postgres.xxxx:你的密码@aws-0-ap-southeast-1.pooler.supabase.com:5432/postgres"
@@ -247,7 +259,8 @@ DATABASE_URL = "postgresql://postgres.xxxx:你的密码@aws-0-ap-southeast-1.poo
 首次部署时程序会自动建 `users` 和 `sessions` 两张表，不需要手工执行 SQL。
 
 > 连接失败排查：确认密码里的特殊字符已 URL 编码（如 `@` 要写成 `%40`）；
-> 若提示 SSL 相关错误，可在连接串末尾加 `?sslmode=require`。
+> 若提示 SSL 相关错误，可在连接串末尾加 `?sslmode=require`；
+> 若提示连接数耗尽，检查是否有其他客户端占用了 Supabase 免费版极少的并发连接（本项目已把连接池限制在 8 条以内）。
 
 ---
 

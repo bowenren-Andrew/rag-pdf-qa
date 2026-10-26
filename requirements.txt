@@ -13,7 +13,9 @@ python-dotenv>=1.0.0
 
 # v3 新增：数据库 ORM、Postgres 驱动、Fernet 加密
 sqlalchemy>=2.0.0
-psycopg2-binary>=2.9.0
+# SQLAlchemy 2.1+ 默认使用 psycopg v3 方言（不再需要 psycopg2）；
+# [binary] 附带预编译二进制，云端无需编译环境。
+psycopg[binary]>=3.1.0
 cryptography>=42.0.0
 
 # 仅用于运行 tests/ 下的单元测试，部署时可省略

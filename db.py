@@ -56,10 +56,21 @@ def get_engine():
     """获取（或创建）数据库引擎，懒加载，避免 import 时就连接数据库。"""
     global _engine
     if _engine is None:
-        kwargs = {"pool_pre_ping": True}  # 云端数据库可能断开连接，每次用完 Monday 自动探活
+        # pool_pre_ping：云端数据库可能断开连接，取连接前自动探活，避免使用失效连接
+        kwargs = {"pool_pre_ping": True}
         if DATABASE_URL.startswith("sqlite"):
             # sqlite 多线程（Streamlit 每个会话一个线程）需要关闭同线程检查
             kwargs["connect_args"] = {"check_same_thread": False}
+        else:
+            # Postgres（Supabase）：免费版并发连接数很少，必须限制连接池规模，
+            # 否则高峰期会出现 "remaining connection slots are reserved" 报错。
+            # pool_recycle 定期回收长连接，防止被服务端（pooler）单方面断开。
+            kwargs.update(
+                pool_size=3,       # 常驻连接数
+                max_overflow=5,    # 峰值最多再临时开 5 条（合计上限 8）
+                pool_recycle=280,  # 秒；小于 Supabase pooler 的空闲超时
+                pool_timeout=30,   # 等连接最多 30 秒，超时给出错误而不是一直卡住
+            )
         _engine = create_engine(DATABASE_URL, **kwargs)
     return _engine
 
