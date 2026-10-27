@@ -1,5 +1,8 @@
 # 📄 基于 RAG 的 PDF 智能问答助手
 
+> 🔗 在线体验：https://ren-rag-pdf.streamlit.app/
+
+
 > 上传 PDF，让大模型只依据你的文档回答问题 —— 答案流式输出，并附带命中原文片段与相似度分数。
 > 当前版本：**v2**（Python + Streamlit + Chroma + BGE 中文向量模型 + DeepSeek）
 
