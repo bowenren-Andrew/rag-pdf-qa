@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-app.py（v3.1）
+app.py（v3.3）
 职责：Streamlit 界面（单一职责：只做交互与展示，业务逻辑在 auth/db/loader/vectorstore/qa）。
 - v3 变更：新增账号体系（注册/登录）、session_state 保存当前用户；
           知识库与会话按 user_id 隔离；每位用户使用自己的 DeepSeek Key。
@@ -8,9 +8,13 @@ app.py（v3.1）
           文档页支持 PDF 与 PPTX 上传（按后缀分发解析）；
           图片型 PDF 走 OCR 兜底，识别失败的页码用一条提示列出；
           来源展示按类型区分「第 X 页」/「第 X 张」。
+- v3.2 变更：文档页新增「强制全文 OCR」开关，解决公式类 PDF 提取不出公式的问题。
+- v3.3 变更（持久化）：文档与片段存数据库（Chroma 退役），云端重启后不丢；
+          新增会话-文档绑定：加载旧会话恢复其文档列表与摘要；
+          问答检索默认限定在本会话选定的文档内。
 - 页面结构（st.navigation 多页面）：
   1) 💬 问答      —— 聊天、流式回答、引用原文与相似度、文档摘要与推荐问题、会话管理
-  2) 📁 我的文档  —— 上传 PDF / PPTX 入库（查重）、已入库列表与删除
+  2) 📁 我的文档  —— 上传 PDF / PPTX 入库（查重、存库）、已入库列表与删除
   3) ⚙️ 设置      —— 账号信息、API Key 管理（加密存储 + 掩码显示）、修改密码
 会话数据存放在数据库（见 db.py），不再使用本地 JSON 文件。
 运行方式：streamlit run app.py
@@ -27,9 +31,14 @@ from vectorstore import (
     add_document,
     delete_document,
     document_exists,
-    list_documents,
+    list_document_details,
+    save_document_summary,
     similarity_search,
 )
+
+# 原始文件字节入库上限：超过则不存原始文件（片段与摘要仍会持久化），
+# 避免撑爆 Supabase 免费版数据库（500MB）
+MAX_FILE_BYTES = 20 * 1024 * 1024
 
 st.set_page_config(
     page_title="PDF 智能问答",
@@ -109,6 +118,10 @@ def _reset_chat_state():
     st.session_state.messages = []
     st.session_state.doc_briefs = {}  # {文件名: {"summary":..., "questions":[...]}}
     st.session_state.pending_question = None  # 点击推荐问题后待发送的问题
+    # v3.3：会话-文档绑定（检索范围）与「会话还没创建时先记着」的待绑定文档
+    st.session_state.session_doc_ids = []  # 当前会话已绑定的文档 ID
+    st.session_state.pending_doc_ids = []  # 会话创建后要立即绑定的文档 ID
+    st.session_state.session_scope_names = []  # 当前检索范围（文件名列表，空=全部）
 
 
 if "user" not in st.session_state:
@@ -251,6 +264,58 @@ def save_current_session():
     )
 
 
+def _load_session_docs(session_id: int):
+    """
+    v3.3：按绑定关系恢复某个会话的文档列表与摘要（db 只返回当前用户的数据）。
+    - 文档列表写进 session_doc_ids（决定检索范围）；
+    - 每篇文档持久化的摘要恢复进 doc_briefs（问答页重新可见、可点击推荐问题）。
+    """
+    docs = db.list_session_documents(USER_ID, session_id)
+    st.session_state.session_doc_ids = [d["id"] for d in docs]
+    st.session_state.session_scope_names = [d["filename"] for d in docs]
+    st.session_state.doc_briefs = {}
+    for d in docs:
+        if d.get("summary"):
+            st.session_state.doc_briefs[d["filename"]] = d["summary"]
+
+
+def _bind_pending_docs(session_id: int):
+    """v3.3：把上传时（会话尚未创建）记下的文档绑定到刚创建的会话上。"""
+    pending = st.session_state.get("pending_doc_ids") or []
+    if pending and session_id:
+        db.bind_documents_to_session(
+            USER_ID, session_id, pending, replace=False
+        )
+        st.session_state.session_doc_ids = list(
+            set(st.session_state.get("session_doc_ids", []) + pending)
+        )
+        st.session_state.pending_doc_ids = []
+
+
+def _doc_summary_of(filename: str) -> dict | None:
+    """从数据库读取某篇文档持久化的摘要（没生成过或已删除则返回 None）。"""
+    try:
+        d = db.get_document_by_name(USER_ID, filename)
+        return d.get("summary") if d else None
+    except Exception:
+        return None
+
+
+def _file_bytes_for_storage(f) -> bytes | None:
+    """
+    读取上传文件的原始字节用于持久化；超过上限（20MB）返回 None。
+    片段与摘要仍会正常入库，只是不再保存原始文件。
+    """
+    try:
+        data = f.getvalue()
+    except Exception:
+        return None
+    if data and len(data) > MAX_FILE_BYTES:
+        st.caption("（原始文件超过 20MB，仅保存解析后的片段与摘要）")
+        return None
+    return data
+
+
 # ---------- 页面一：💬 问答 ----------
 def page_chat():
     """问答页：聊天窗口、流式回答、引用来源、摘要推荐问题、会话管理。"""
@@ -276,12 +341,63 @@ def page_chat():
                     st.session_state.session_id = loaded["id"]
                     st.session_state.session_title = loaded["title"]
                     st.session_state.messages = loaded["messages"]
+                    _load_session_docs(loaded["id"])  # 恢复该会话的文档与摘要
                     st.rerun()
             if cols[2].button("删除", key=f"del_{s['id']}"):
-                db.delete_session(USER_ID, s["id"])  # 只能删自己的
+                db.delete_session(USER_ID, s["id"])  # 只能删自己的（绑定随之清理）
                 if s["id"] == st.session_state.session_id:
                     _reset_chat_state()
                 st.rerun()
+
+    # v3.3：本会话检索范围——多选自己的文档，检索只查选中的；
+    # 加载旧会话时默认选中该会话绑定的文档；没绑定过则默认全部
+    all_docs = list_document_details(USER_ID)
+    all_names = [d["filename"] for d in all_docs]
+    scope_names = []
+    if all_names:
+        with st.sidebar:
+            st.divider()
+            st.subheader("📎 本会话文档")
+            bound_names = [
+                d["filename"]
+                for d in db.list_session_documents(
+                    USER_ID, st.session_state.session_id
+                )
+            ] if st.session_state.session_id else []
+            default_names = bound_names or all_names
+            with st.form("session_docs_form"):
+                selected = st.multiselect(
+                    "问答只检索选中的文档",
+                    options=all_names,
+                    default=default_names,
+                    help="选择会随会话一起保存；加载旧会话时自动恢复当时的选择。",
+                )
+                if st.form_submit_button("保存为本会话文档", use_container_width=True):
+                    ids = db.get_document_ids_by_names(USER_ID, selected)
+                    if st.session_state.session_id:
+                        db.bind_documents_to_session(
+                            USER_ID, st.session_state.session_id, ids, replace=True
+                        )
+                        st.session_state.session_doc_ids = ids
+                        st.session_state.session_scope_names = list(selected)
+                        st.rerun()
+                    else:
+                        # 会话要等首次提问才创建：先记为待绑定，创建后立即保存
+                        st.session_state.pending_doc_ids = ids
+                        st.session_state.session_scope_names = list(selected)
+                        st.info("已记下选择，首次提问后会随会话一起保存。")
+            scope_names = selected
+            if not scope_names:
+                st.caption("（未选择任何文档：检索将覆盖你的全部文档）")
+    st.session_state.session_scope_names = scope_names
+
+    # 摘要与推荐问题跟随检索范围展示（持久化在文档上的摘要即时可见）
+    for name in scope_names:
+        brief = st.session_state.doc_briefs.get(name)
+        if brief is None:
+            brief = _doc_summary_of(name)  # 从数据库读（新增文档或旧会话恢复）
+        if brief:
+            st.session_state.doc_briefs[name] = brief
 
     # 主区：上次入库生成的摘要与推荐问题
     for name, brief in st.session_state.doc_briefs.items():
@@ -336,6 +452,7 @@ def handle_question(question: str):
     if not st.session_state.session_id:
         st.session_state.session_title = question[:20]
         st.session_state.session_id = db.create_session(USER_ID, st.session_state.session_title)
+        _bind_pending_docs(st.session_state.session_id)  # 把记下的文档选择一并绑定
 
     # 先取历史（此时 messages 里还没有本轮问题），再把本轮问题追加进去
     history = _build_history()
@@ -343,10 +460,14 @@ def handle_question(question: str):
     with st.chat_message("user"):
         st.markdown(question)
 
+    # v3.3：检索默认限定在本会话选定的文档内；没选则覆盖全部文档
+    scope = st.session_state.get("session_scope_names") or []
     contexts, answer = [], None
     with st.chat_message("assistant"):
         try:
-            contexts = similarity_search(USER_ID, question, top_k=4)
+            contexts = similarity_search(
+                USER_ID, question, top_k=4, sources=scope or None
+            )
             # write_stream 会逐段消费生成器，实现打字机效果
             answer = st.write_stream(
                 stream_answer(question, contexts, history=history, api_key=api_key)
@@ -438,13 +559,30 @@ def page_documents():
                     st.warning(f"OCR 未启用（{ocr_report['ocr_error']}），图片页内容可能被跳过。")
 
                 try:
-                    n = add_document(USER_ID, f.name, chunks)
-                    st.success(f"《{f.name}》入库完成：{n} 个片段")
+                    n = add_document(
+                        USER_ID,
+                        f.name,
+                        chunks,
+                        session_id=st.session_state.session_id,
+                        file_data=_file_bytes_for_storage(f),
+                        file_size=f.size,
+                    )
+                    if n == 0:
+                        st.info(f"《{f.name}》已入库，跳过。如需重新处理，请先删除它。")
+                        continue
+                    st.success(f"《{f.name}》入库完成：{n} 个片段（已持久化，重启不丢失）")
                 except Exception as e:
                     st.error(f"《{f.name}》入库失败：{e}")
                     continue
 
-                # 入库后自动生成全文摘要 + 3 个推荐问题（只在该文档内检索）
+                # v3.3：会话还没创建（首次提问才会创建）时先记下，创建后立即绑定
+                if not st.session_state.session_id:
+                    doc = db.get_document_by_name(USER_ID, f.name)
+                    if doc:
+                        st.session_state.pending_doc_ids.append(doc["id"])
+
+                # 入库后自动生成全文摘要 + 3 个推荐问题（只在该文档内检索），
+                # 生成结果持久化到文档上，随会话/文档恢复
                 if not api_key:
                     st.info(f"《{f.name}》已入库；填写 API Key 后可自动生成摘要与推荐问题。")
                     continue
@@ -455,29 +593,50 @@ def page_documents():
                         top_k=6,
                         source=f.name,
                     )
-                    st.session_state.doc_briefs[f.name] = generate_doc_brief(
-                        f.name, ctx, api_key=api_key
-                    )
+                    brief = generate_doc_brief(f.name, ctx, api_key=api_key)
+                    st.session_state.doc_briefs[f.name] = brief
+                    save_document_summary(USER_ID, f.name, brief)  # 持久化
                 except QAFriendlyError as e:
                     st.warning(f"《{f.name}》摘要生成失败：{e}")
                 except Exception as e:
                     st.warning(f"《{f.name}》摘要生成失败：{e}")
 
     st.divider()
-    docs = list_documents(USER_ID)
+    docs = list_document_details(USER_ID)
     if not docs:
         st.caption("知识库还是空的，先上传一个 PDF 吧。")
         return
 
-    st.markdown("**已入库文档**")
-    for name in docs:
+    # 当前会话绑定的文档（列表里打 ✅ 标记）
+    bound_ids = set(st.session_state.get("session_doc_ids", [])) | set(
+        st.session_state.get("pending_doc_ids", [])
+    )
+    st.markdown("**已入库文档**（持久保存在数据库中，重启应用不会丢失）")
+    for d in docs:
+        name = d["filename"]
+        icon = "📊" if d.get("doc_type") == "pptx" else "📄"
+        in_session = "✅ " if d["id"] in bound_ids else ""
+        size_mb = (d.get("file_size") or 0) / (1024 * 1024)
         cols = st.columns([0.72, 0.28])
-        icon = "📊" if name.lower().endswith(".pptx") else "📄"
-        cols[0].write(f"{icon} {name}")
+        cols[0].write(
+            f"{icon} {in_session}{name} · {d.get('chunk_count', 0)} 片段"
+            + (f" · {size_mb:.1f}MB" if size_mb >= 0.1 else "")
+        )
         if cols[1].button("删除", key=f"del_doc_{name}"):
             try:
                 removed = delete_document(USER_ID, name)
                 st.session_state.doc_briefs.pop(name, None)
+                # 同步清理本地记录的绑定状态
+                st.session_state.session_doc_ids = [
+                    i for i in st.session_state.get("session_doc_ids", []) if i != d["id"]
+                ]
+                st.session_state.pending_doc_ids = [
+                    i for i in st.session_state.get("pending_doc_ids", []) if i != d["id"]
+                ]
+                if removed:
+                    st.session_state.session_scope_names = [
+                        n for n in st.session_state.get("session_scope_names", []) if n != name
+                    ]
                 st.success(
                     f"已删除《{name}》（{removed} 个片段），可重新上传。"
                     if removed

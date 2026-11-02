@@ -4,13 +4,13 @@
 
 
 > 上传 PDF，让大模型只依据你的文档回答问题 —— 答案流式输出，并附带命中原文片段与相似度分数。
-> 当前版本：**v2**（Python + Streamlit + Chroma + BGE 中文向量模型 + DeepSeek）
+> 当前版本：**v3.3**（Streamlit + Supabase Postgres/pgvector + BGE 中文向量模型 + DeepSeek）
 
 ---
 
 ## 一、项目介绍
 
-这是一个**检索增强生成（RAG）**的入门级完整实现：把 PDF 切分成文本片段 → 用中文向量模型转成向量存入 Chroma → 提问时先检索最相关的片段 → 把片段拼进提示词交给 DeepSeek 生成回答。
+这是一个**检索增强生成（RAG）**的入门级完整实现：把 PDF 切分成文本片段 → 用中文向量模型转成向量**存入数据库（Postgres + pgvector）** → 提问时先检索最相关的片段 → 把片段拼进提示词交给 DeepSeek 生成回答。
 
 它解决的核心问题是：**大模型不知道你的私有文档内容，而且容易"编造"**。本项目通过"先检索、后生成"的方式，让回答有据可依，并在界面上把依据（原文片段 + 页码 + 相似度）直接展示出来，方便核对。
 
@@ -19,9 +19,10 @@
 | 原则 | 体现 |
 | --- | --- |
 | 职责单一 | 四个文件各管一件事：解析 / 向量库 / 大模型 / 界面 |
-| 轻量无后端 | 不使用数据库、不做登录注册，向量库与会话历史均为本地文件 |
+| 轻量部署 | 单个 Streamlit 应用即可跑通；本地 sqlite 零配置开发，云端 Postgres 一条连接串 |
 | 中文友好 | 全量中文注释；Key 缺失、网络异常、API 报错均给出中文提示，不崩溃 |
-| 密钥安全 | API Key 只从 `.env` 读取，不硬编码进代码，已被 `.gitignore` 忽略 |
+| 密钥安全 | API Key 只从 `.env`/Secrets 读取，用户级 Key 经 Fernet 加密入库，不硬编码 |
+| 全面持久化（v3.3） | 文档、片段向量、摘要、会话及其文档绑定全部存数据库，云端重启/休眠后不丢 |
 
 ---
 
@@ -39,6 +40,9 @@
 - **三页面结构（v3）**：💬 问答 / 📁 我的文档 / ⚙️ 设置，用 `st.navigation` 组织
 - **多轮对话上下文（v3.1）**：追问时自动带上本会话的历史（按字符数截断，最近一轮必留），历史只作背景，回答仍只依据本次检索到的资料
 - **支持 PPTX（v3.1）**：除 PDF 外可直接上传 PowerPoint，逐张幻灯片提取文本（含表格单元格）
+- **文件持久化（v3.3）**：文档片段与向量存入数据库（云端走 pgvector，本地走 sqlite + numpy 余弦），**重启应用后无需重新上传**；原始文件字节（≤20MB）一并保存
+- **会话-文档绑定（v3.3）**：每个会话记住自己用的文档，加载旧会话自动恢复文档列表与摘要；问答检索默认只查本会话选定的文档
+- **摘要持久化（v3.3）**：全文摘要与推荐问题随文档存库，换设备/重启后依然可见
 
 ---
 
@@ -107,7 +111,7 @@
 | 文档解析 | PyPDF2 + python-pptx + PyMuPDF | PDF 逐页提取、PPTX 逐张幻灯片提取；扫描件页渲染后 OCR |
 | OCR | rapidocr-onnxruntime（RapidOCR） | 中文识别，模型随包内置，懒加载 |
 | 向量模型 | sentence-transformers · `BAAI/bge-small-zh-v1.5` | 中文语义向量，约 100MB，输出 512 维 |
-| 向量库 | Chroma（`PersistentClient`） | 每个用户一个 collection，余弦距离检索 |
+| 向量存储 | 数据库 `document_chunks` 表 | 云端 Postgres + **pgvector**（SQL 余弦距离）；本地 sqlite 存 float32 字节、numpy 算余弦，两条路径结果一致 |
 | 大模型 | DeepSeek（`deepseek-chat`） | OpenAI 兼容 SDK，支持流式 |
 | 数据库 | SQLAlchemy + sqlite / Postgres | 本地 sqlite，云端接 Supabase Postgres |
 | 密码与加密 | hashlib.pbkdf2_hmac + cryptography.Fernet | 密码加盐哈希，用户 Key 对称加密 |
@@ -133,7 +137,7 @@ flowchart TD
     B --> C[loader.py<br/>PyPDF2 提取 + 清洗]
     C --> D[切分：约 500 字/段<br/>段间约 50 字重叠]
     D --> E[vectorstore.py<br/>BGE 中文向量化]
-    E --> F[(Chroma<br/>pdf_chunks_u{user_id})]
+    E --> F[(数据库 document_chunks<br/>云端 pgvector / 本地 sqlite)]
 
     G[用户提问] --> H[取用户解密后的 Key]
     H --> I[query 向量化<br/>加 BGE 指令前缀]
@@ -176,7 +180,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-> 依赖：`streamlit`、`PyPDF2`、`sentence-transformers`、`chromadb`、`openai`、`python-dotenv`
+> 依赖：`streamlit`、`PyPDF2`、`sentence-transformers`、`openai`、`python-dotenv`、`sqlalchemy`、`psycopg[binary]`、`cryptography`、`python-pptx`、`pymupdf`、`rapidocr-onnxruntime`（v3.3 起 chromadb 已移除）
 
 ### 3. 配置环境变量
 
@@ -260,9 +264,10 @@ APP_SECRET_KEY = "你的Fernet密钥"
 
 | 事项 | 说明 |
 | --- | --- |
-| 知识库不持久 | 云端容器重启后 `chroma_db/` 会被清空，需要重新上传 PDF（免费版无持久磁盘） |
-| 会话历史**持久** | 会话存在 Supabase Postgres 里，容器重启不丢（v3 相比 v2 的本地 JSON 是一大改进） |
-| 资源限制 | 免费版约 1GB 内存；`torch + bge-small-zh-v1.5 + Chroma` 比较吃紧，不宜上传超大 PDF |
+| 知识库**持久**（v3.3） | 文档片段与向量存在 Supabase Postgres（pgvector），容器重启/休眠唤醒后**无需重新上传** |
+| 原始文件 | ≤20MB 的原始文件字节随文档入库；更大的文件只持久化片段与摘要 |
+| 会话历史**持久** | 会话及其文档绑定存在 Supabase Postgres 里，容器重启不丢（v3 相比 v2 的本地 JSON 是一大改进） |
+| 资源限制 | 免费版约 1GB 内存；`torch + bge-small-zh-v1.5` 较吃紧，不宜上传超大 PDF（v3.3 移除 Chroma 后内存压力更小） |
 | 密钥安全 | `APP_SECRET_KEY` 与数据库连接串只走 Secrets，不要把 `.env` 提交到仓库 |
 
 ---
@@ -331,7 +336,7 @@ pdf_qa_app/
 ├── 修改说明_v3.md              # v2 → v3 改动说明
 ├── 修改说明_v3.1.md            # v3 → v3.1 改动说明
 ├── 修改说明_v3.2.md            # v3.1 → v3.2 改动说明（强制全文 OCR）
-├── chroma_db/                 # 向量库（运行时生成，不提交）
+├── chroma_db/                 # （已废弃）v3.2 及以前的本地向量库目录，可手动删除
 ├── app.db                     # 本地 sqlite（不配 DATABASE_URL 时自动生成，不提交）
 └── tests/                     # 单元测试
     ├── conftest.py            # sys.path + 临时数据库 / Fernet 密钥 fixture
@@ -342,7 +347,8 @@ pdf_qa_app/
     ├── test_pptx.py           # v3.1 新增：PPTX 解析与按后缀分发（8 例）
     ├── test_multiturn.py      # v3.1 新增：历史截断与四段提示词（12 例）
     ├── test_ocr_fallback.py   # v3.1 新增：OCR 兜底与降级（8 例，含 1 例默认跳过）
-    └── test_force_ocr.py      # v3.2 新增：强制全文 OCR 与失败回退（13 例，含 1 例默认跳过）
+    ├── test_force_ocr.py      # v3.2 新增：强制全文 OCR 与失败回退（13 例，含 1 例默认跳过）
+    └── test_persistence.py    # v3.3 新增：文档/片段/摘要持久化、会话绑定与越权（18 例）
 ```
 
 ---
@@ -362,7 +368,7 @@ pytest tests/test_loader.py -v       # 只跑切分相关用例
 pytest tests/test_qa.py -k JSON      # 只跑名字含 JSON 的用例
 ```
 
-当前共 **97 passed / 2 skipped**，覆盖 loader 的文本清洗/切句/重叠切分/硬切兜底、PPTX 解析、OCR 自动兜底与强制 OCR；qa 的 JSON 解析（含代码块围栏、非法 JSON 降级）、错误处理（缺 Key / 401 / 网络失败）、流式输出拼接与多轮历史截断；auth 的密码哈希与 Key 加解密；会话按用户隔离与越权防护。
+当前共 **115 passed / 2 skipped**，覆盖 loader 的文本清洗/切句/重叠切分/硬切兜底、PPTX 解析、OCR 自动兜底与强制 OCR；qa 的 JSON 解析（含代码块围栏、非法 JSON 降级）、错误处理（缺 Key / 401 / 网络失败）、流式输出拼接与多轮历史截断；auth 的密码哈希与 Key 加解密；会话按用户隔离与越权防护。
 
 > 2 个 skipped 是真实 OCR 引擎的冒烟用例，默认跳过以免加载识别模型；设置环境变量 `RUN_REAL_OCR=1` 后可启用。
 
@@ -388,4 +394,4 @@ A：检索未命中有效片段。可在 `app.py` 中把 `similarity_search(ques
 A：修改 `qa.py` 顶部的 `MODEL` 常量即可（如 `deepseek-reasoner`），接口地址无需改动。
 
 **Q：如何清空知识库？**
-A：删除 `chroma_db/` 目录后重启应用；删除 `sessions/` 可清空全部历史会话。
+A：v3.3 起知识库在数据库里：在「📁 我的文档」页逐个删除即可；想彻底清空可直接清空数据库的 documents / document_chunks 表（云端在 Supabase SQL 编辑器执行 `TRUNCATE document_chunks, documents, session_documents CASCADE;`）。
