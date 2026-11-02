@@ -674,15 +674,9 @@ def bind_documents_to_session(
     """
     把文档绑定到某个会话（先校验会话与文档都属于当前用户，防越权绑定）。
     :param replace: True 时整体覆盖（先清掉旧绑定），False 时追加去重。
+    空列表 + replace=True 表示「清空该会话的绑定」，同样先校验会话归属：
+    会话不存在或不属于当前用户时返回 False，不删任何绑定。
     """
-    if not document_ids:
-        if replace:
-            with session_scope() as db:
-                db.query(SessionDocument).filter(
-                    SessionDocument.session_id == session_id
-                ).delete()
-            return True
-        return True
     with session_scope() as db:
         s = (
             db.query(ChatSession)
@@ -691,6 +685,12 @@ def bind_documents_to_session(
         )
         if s is None:
             return False
+        if not document_ids:
+            if replace:
+                db.query(SessionDocument).filter(
+                    SessionDocument.session_id == session_id
+                ).delete()
+            return True
         owned = {
             r[0]
             for r in db.query(Document.id)

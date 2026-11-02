@@ -365,28 +365,40 @@ def page_chat():
                 )
             ] if st.session_state.session_id else []
             default_names = bound_names or all_names
-            with st.form("session_docs_form"):
-                selected = st.multiselect(
-                    "问答只检索选中的文档",
-                    options=all_names,
-                    default=default_names,
-                    help="选择会随会话一起保存；加载旧会话时自动恢复当时的选择。",
-                )
-                if st.form_submit_button("保存为本会话文档", use_container_width=True):
-                    ids = db.get_document_ids_by_names(USER_ID, selected)
-                    if st.session_state.session_id:
-                        db.bind_documents_to_session(
-                            USER_ID, st.session_state.session_id, ids, replace=True
-                        )
-                        st.session_state.session_doc_ids = ids
-                        st.session_state.session_scope_names = list(selected)
-                        st.rerun()
-                    else:
-                        # 会话要等首次提问才创建：先记为待绑定，创建后立即保存
-                        st.session_state.pending_doc_ids = ids
-                        st.session_state.session_scope_names = list(selected)
-                        st.info("已记下选择，首次提问后会随会话一起保存。")
+            # 选择即时生效：多选框不放在 form 里，改动即触发重跑并同步检索范围；
+            # 有会话时直接把绑定写进数据库（replace=True 覆盖旧绑定），
+            # 会话还没创建时先记为待绑定（首次提问创建会话后立即保存）。
+            selected = st.multiselect(
+                "问答只检索选中的文档",
+                options=all_names,
+                default=default_names,
+                help=(
+                    "勾选改动即时生效并自动保存到当前会话；"
+                    "加载旧会话时自动恢复当时的选择。"
+                ),
+            )
             scope_names = selected
+            selected_list = list(selected)
+            prev_scope = list(st.session_state.get("session_scope_names") or [])
+            # 初始未触碰状态（无会话、无历史范围、选择等于默认值）不算改动，
+            # 避免刚进页面就把 pending 填满，保持「未选=覆盖全部」的原有语义。
+            untouched_first_run = (
+                not st.session_state.session_id
+                and not prev_scope
+                and selected_list == list(default_names)
+            )
+            if not untouched_first_run and selected_list != prev_scope:
+                ids = db.get_document_ids_by_names(USER_ID, selected_list)
+                if st.session_state.session_id:
+                    db.bind_documents_to_session(
+                        USER_ID, st.session_state.session_id, ids, replace=True
+                    )
+                    st.session_state.session_doc_ids = ids
+                else:
+                    # 会话要等首次提问才创建：先记为待绑定，创建后立即保存
+                    st.session_state.pending_doc_ids = ids
+                    st.caption("已记下选择，首次提问后会随会话一起保存。")
+                st.session_state.session_scope_names = selected_list
             if not scope_names:
                 st.caption("（未选择任何文档：检索将覆盖你的全部文档）")
     st.session_state.session_scope_names = scope_names

@@ -224,6 +224,31 @@ def test_跨用户读取别人的会话文档为空(fake_model, two_users):
     assert db.list_session_documents(ub, sid) == []
 
 
+def test_跨用户空列表清不掉别人的绑定(fake_model, two_users):
+    """B 用空列表 + replace=True 也清不掉 A 会话的绑定（空分支同样校验归属）。"""
+    ua, ub = two_users
+    vs.add_document(ua, "ka.pdf", _chunks("A 的文档。"))
+    a_sid = db.create_session(ua, "A 的会话")
+    a_doc = db.get_document_by_name(ua, "ka.pdf")["id"]
+    db.bind_documents_to_session(ua, a_sid, [a_doc])
+    # B 拿 A 的会话 id 传空列表 + replace=True：应返回 False，绑定原样保留
+    assert db.bind_documents_to_session(ub, a_sid, [], replace=True) is False
+    assert db.get_session_document_ids(ua, a_sid) == [a_doc], "A 的绑定不能被清掉"
+
+
+def test_清空自己会话的绑定(fake_model, two_users):
+    """A 清空自己会话的绑定：返回 True，绑定被清空（原语义保持）。"""
+    ua, _ = two_users
+    vs.add_document(ua, "la.pdf", _chunks("A 的文档。"))
+    sid = db.create_session(ua, "A 的会话")
+    doc_id = db.get_document_by_name(ua, "la.pdf")["id"]
+    db.bind_documents_to_session(ua, sid, [doc_id])
+    assert db.bind_documents_to_session(ua, sid, [], replace=True) is True
+    assert db.get_session_document_ids(ua, sid) == []
+    # 文档本身不受影响（只是解除绑定）
+    assert vs.document_exists(ua, "la.pdf")
+
+
 # ---------------- 检索范围与质量 ----------------
 
 def test_检索限定在指定文档列表内(fake_model, two_users):
