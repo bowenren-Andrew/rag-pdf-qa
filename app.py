@@ -149,7 +149,9 @@ def render_auth_page():
         # 用 radio 代替 tabs：注册成功后可以直接切回登录页并回填用户名。
         # 切换发生在下一次 rerun、radio 实例化之前，避免直接改 widget state 被忽略。
         if st.session_state.pop("_switch_to_login", False):
-            st.session_state.pop("auth_mode", None)
+            # 在 radio 实例化之前写入值，前后端都会显示「登录」；直接 pop 会让
+            # 前端仍保留「注册」的选中态，与已渲染的登录表单不一致。
+            st.session_state["auth_mode"] = "登录"
         mode = st.radio(
             "账号操作",
             ["登录", "注册"],
