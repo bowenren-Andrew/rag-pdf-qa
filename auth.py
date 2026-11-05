@@ -9,9 +9,12 @@ auth.py（v3）
 """
 import hashlib
 import hmac
+import math
 import os
 import re
 import secrets
+import threading
+import time
 
 from cryptography.fernet import Fernet, InvalidToken
 
@@ -172,6 +175,95 @@ def change_password(user_id: int, old_password: str, new_password: str) -> tuple
         return False, msg
     db.update_password_hash(user_id, hash_password(new_password))
     return True, "密码修改成功，请重新登录。"
+
+
+# ---------------- 登录限流（L-05） ----------------
+# 连续失败达到阈值后按账号锁定一段时间。计数放在进程内：
+# 不落库、不改表结构；应用重启或重新部署后自动清零。
+LOGIN_MAX_FAILURES = 5
+LOGIN_LOCK_SECONDS = 15 * 60
+
+_login_failures: dict[str, dict] = {}
+_login_failures_lock = threading.Lock()
+_LOGIN_FAILURE_ENTRY_LIMIT = 1000
+
+
+def _normalize_login_name(username: str) -> str:
+    """锁定按账号维度统计，用户名大小写与首尾空格不区分。"""
+    return (username or "").strip().lower()
+
+
+def get_login_lock_remaining(username: str) -> int:
+    """返回该账号剩余锁定秒数；未锁定或已过期返回 0。"""
+    key = _normalize_login_name(username)
+    if not key:
+        return 0
+    with _login_failures_lock:
+        state = _login_failures.get(key)
+        if not state or state["locked_until"] <= 0:
+            # 尚未触发锁定：保留失败计数，不清空
+            return 0
+        remaining = int(math.ceil(state["locked_until"] - time.monotonic()))
+        if remaining > 0:
+            return remaining
+        # 锁定已过期：清掉旧计数，重新开始
+        _login_failures.pop(key, None)
+        return 0
+
+
+def record_login_failure(username: str) -> int:
+    """
+    记录一次登录失败。
+    返回本次触发的剩余锁定秒数；未达到阈值返回 0。
+    """
+    key = _normalize_login_name(username)
+    if not key:
+        return 0
+    now = time.monotonic()
+    with _login_failures_lock:
+        state = _login_failures.setdefault(
+            key, {"count": 0, "locked_until": 0.0, "last_failure": now}
+        )
+        state["count"] += 1
+        state["last_failure"] = now
+        if state["count"] < LOGIN_MAX_FAILURES:
+            return 0
+        state["count"] = 0
+        state["locked_until"] = now + LOGIN_LOCK_SECONDS
+        _prune_login_failures(now)
+        return LOGIN_LOCK_SECONDS
+
+
+def clear_login_failures(username: str) -> None:
+    """登录成功后清零该账号的失败计数与锁定状态。"""
+    key = _normalize_login_name(username)
+    if not key:
+        return
+    with _login_failures_lock:
+        _login_failures.pop(key, None)
+
+
+def _prune_login_failures(now: float) -> None:
+    """条目过多时清理早已过期且不再锁定的账号，避免字典无限增长。"""
+    if len(_login_failures) <= _LOGIN_FAILURE_ENTRY_LIMIT:
+        return
+    stale = [
+        name
+        for name, state in _login_failures.items()
+        if state["locked_until"] <= now
+        and now - state["last_failure"] > LOGIN_LOCK_SECONDS
+    ]
+    for name in stale:
+        _login_failures.pop(name, None)
+
+
+def format_lock_remaining(seconds: int) -> str:
+    """把剩余秒数格式化成「X 分 Y 秒」，用于锁定提示。"""
+    seconds = max(0, int(seconds))
+    minutes, rest = divmod(seconds, 60)
+    if minutes:
+        return f"{minutes} 分 {rest} 秒"
+    return f"{rest} 秒"
 
 
 # ---------------- API Key 加解密 ----------------

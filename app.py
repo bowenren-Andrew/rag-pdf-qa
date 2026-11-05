@@ -171,7 +171,16 @@ def render_auth_page():
 
 
 def render_login_form():
-    """登录表单：失败统一提示「用户名或密码不正确」。"""
+    """登录表单：失败统一提示「用户名或密码不正确」，连续失败按账号临时锁定。"""
+    # L-05：锁定时把剩余时间直接显示在表单上方，避免用户反复试密码
+    locked_remaining = auth.get_login_lock_remaining(
+        st.session_state.get("login_username", "")
+    )
+    if locked_remaining > 0:
+        st.warning(
+            "该账号连续登录失败次数过多，已临时锁定，请在 "
+            f"{auth.format_lock_remaining(locked_remaining)} 后重试。"
+        )
     with st.form("login_form"):
         username = st.text_input(
             "用户名",
@@ -181,17 +190,29 @@ def render_login_form():
         password = st.text_input("密码", type="password")
         submitted = st.form_submit_button("登录", use_container_width=True, type="primary")
     if submitted:
+        remaining = auth.get_login_lock_remaining(username)
+        if remaining > 0:
+            # 锁定期间的任何尝试都拒绝；上方警告已给出剩余时间
+            return
         try:
             user = auth.login(username, password)
         except Exception as e:
             st.error(f"登录失败：{e}")
             return
         if user:
+            auth.clear_login_failures(username)
             st.session_state.user = {"id": user["id"], "username": user["username"]}
             _reset_chat_state()
             st.rerun()
         else:
-            st.error("用户名或密码不正确")
+            locked = auth.record_login_failure(username)
+            if locked:
+                st.error(
+                    f"连续 {auth.LOGIN_MAX_FAILURES} 次登录失败，账号已锁定，请在 "
+                    f"{auth.format_lock_remaining(locked)} 后重试。"
+                )
+            else:
+                st.error("用户名或密码不正确")
 
 
 def render_register_form():
