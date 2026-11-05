@@ -43,6 +43,9 @@ logger = logging.getLogger(__name__)
 # 避免撑爆 Supabase 免费版数据库（500MB）
 MAX_FILE_BYTES = 20 * 1024 * 1024
 
+# 提问输入上限（BUG-08）：显示「已输入 / 上限」，超过上限时提示并禁止提交
+MAX_QUESTION_CHARS = 2000
+
 st.set_page_config(
     page_title="PDF 智能问答",
     page_icon="📄",
@@ -143,10 +146,23 @@ def render_auth_page():
         st.caption("上传 PDF → 自动摘要与推荐问题 → 流式问答，答案附带原文出处与相似度")
         st.markdown('<div class="login-card">', unsafe_allow_html=True)
 
-        tab_login, tab_register = st.tabs(["登录", "注册"])
-        with tab_login:
+        # 用 radio 代替 tabs：注册成功后可以直接切回登录页并回填用户名。
+        # 切换发生在下一次 rerun、radio 实例化之前，避免直接改 widget state 被忽略。
+        if st.session_state.pop("_switch_to_login", False):
+            st.session_state.pop("auth_mode", None)
+        mode = st.radio(
+            "账号操作",
+            ["登录", "注册"],
+            horizontal=True,
+            label_visibility="collapsed",
+            key="auth_mode",
+        )
+        notice = st.session_state.pop("auth_notice", None)
+        if notice:
+            st.success(notice)
+        if mode == "登录":
             render_login_form()
-        with tab_register:
+        else:
             render_register_form()
 
         st.markdown("</div>", unsafe_allow_html=True)
@@ -155,7 +171,11 @@ def render_auth_page():
 def render_login_form():
     """登录表单：失败统一提示「用户名或密码不正确」。"""
     with st.form("login_form"):
-        username = st.text_input("用户名", placeholder="3–20 位字母、数字或下划线")
+        username = st.text_input(
+            "用户名",
+            placeholder="3–20 位字母、数字或下划线",
+            key="login_username",
+        )
         password = st.text_input("密码", type="password")
         submitted = st.form_submit_button("登录", use_container_width=True, type="primary")
     if submitted:
@@ -189,7 +209,11 @@ def render_register_form():
             st.error(f"注册失败：{e}")
             return
         if result["ok"]:
-            st.success("注册成功，请切换到「登录」页登录。")
+            # BUG-09：自动切到登录页，并把刚注册的用户名填好
+            st.session_state.login_username = username.strip()
+            st.session_state.auth_notice = "注册成功，请输入密码登录。"
+            st.session_state._switch_to_login = True
+            st.rerun()
         else:
             st.error(result["msg"])
 
@@ -407,6 +431,10 @@ def page_chat():
     """问答页：聊天窗口、流式回答、引用来源、摘要推荐问题、会话管理。"""
     st.markdown('<div class="title-divider"></div>', unsafe_allow_html=True)
 
+    # 上一轮成功提交后清空输入框：必须在 text_area 实例化之前修改 key
+    if st.session_state.pop("_clear_question_input", False):
+        st.session_state["question_input"] = ""
+
     # 会话管理（数据来自数据库，只查当前用户的）
     with st.sidebar:
         st.subheader("💬 会话管理")
@@ -521,9 +549,40 @@ def page_chat():
             if msg.get("sources"):
                 render_sources(msg["sources"])
 
-    typed = st.chat_input("请输入你的问题…")
-    if typed:
-        handle_question(typed)
+    # BUG-08：输入框下方实时显示「已输入 / 上限」，超过上限时提示并禁用发送。
+    input_col, button_col = st.columns([0.85, 0.15])
+    typed = input_col.text_area(
+        "请输入你的问题…",
+        placeholder=f"最多 {MAX_QUESTION_CHARS} 字",
+        height=90,
+        key="question_input",
+        label_visibility="collapsed",
+    )
+    typed = typed or ""
+    question_len = len(typed)
+    too_long = question_len > MAX_QUESTION_CHARS
+    if too_long:
+        st.warning(
+            f"问题已输入 {question_len} 字，超过上限 {MAX_QUESTION_CHARS} 字，"
+            "请删减后再发送。"
+        )
+    st.caption(f"已输入 {question_len} / {MAX_QUESTION_CHARS} 字")
+    submitted = button_col.button(
+        "发送",
+        type="primary",
+        use_container_width=True,
+        disabled=not typed.strip() or too_long,
+    )
+    if submitted:
+        typed = (typed or "").strip()
+        if not typed:
+            st.warning("请输入问题后再发送。")
+        elif len(typed) > MAX_QUESTION_CHARS:
+            st.warning(f"问题不能超过 {MAX_QUESTION_CHARS} 字，请缩短后重试。")
+        else:
+            if handle_question(typed):
+                st.session_state._clear_question_input = True
+                st.rerun()
 
     # 点击推荐问题提问（在同一轮运行中消费 pending_question）
     if st.session_state.pending_question:
@@ -544,11 +603,11 @@ def _build_history() -> list[dict]:
     ]
 
 
-def handle_question(question: str):
+def handle_question(question: str) -> bool:
     """处理一次提问：取用户 Key → 检索 → 带历史流式生成 → 展示来源 → 自动保存会话。"""
     api_key = _require_key_or_guide()
     if not api_key:
-        return
+        return False
 
     # 首次提问时才在数据库创建会话记录，并以前 20 字作为会话标题
     if not st.session_state.session_id:
@@ -589,6 +648,7 @@ def handle_question(question: str):
                 {"role": "assistant", "content": "⚠️ 本次未生成回答，请检查 API Key 或网络后重试。"}
             )
     save_current_session()
+    return True
 
 
 # ---------- 页面二：📁 我的文档 ----------
@@ -750,6 +810,19 @@ def page_documents():
         if cols[1].button("删除", key=f"del_doc_{name}"):
             # 只记录待删目标，弹窗确认后才真正删除
             st.session_state.pending_delete_doc = {"id": d["id"], "name": name}
+
+        # BUG-10：展示入库后的实际切分文本，便于核对断字与 OCR 质量。
+        preview = db.list_document_chunks_preview(USER_ID, d["id"], limit=3)
+        total = d.get("chunk_count", 0)
+        if preview:
+            with st.expander(
+                f"🔍 《{name}》片段预览（前 {len(preview)} / {total} 段）",
+                expanded=False,
+            ):
+                st.caption("以下为入库后的实际片段文本；扫描件展示的是 OCR 后的结果。")
+                for i, chunk in enumerate(preview, start=1):
+                    st.markdown(f"**片段 {i} · 第 {chunk['page']} 页**")
+                    st.text(chunk["text"])
 
     if st.session_state.get("pending_delete_doc"):
         _confirm_delete_document()

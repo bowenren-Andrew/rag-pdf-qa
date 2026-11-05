@@ -54,6 +54,27 @@ def _pdf_error_message(error: Exception) -> str:
     return MSG_BROKEN_PDF
 
 
+def _repair_broken_words(text: str) -> str:
+    """
+    修复 PDF 排版造成的单词/编号断字（BUG-10）。
+
+    只处理低风险模式，避免把正常英文词组粘在一起：
+    - 邮箱局部被拆成 "suppor t@..."：合并成 "support@..."；
+    - 邮箱 @ 两侧的空白；
+    - 型号/编号被拆成 "X 1"、"SN 12345"：合并为连续字符串。
+    """
+    if not text:
+        return ""
+    # 邮箱：最后一个字母与 @ 之间被插入空格（典型：suppor t@example.com）
+    text = re.sub(r"(?<=[A-Za-z])\s+(?=[A-Za-z]{1,2}@)", "", text)
+    # 邮箱：@ 前后被排版空格隔开
+    text = re.sub(r"(?<=[A-Za-z0-9._%+-])\s+(?=@)", "", text)
+    text = re.sub(r"(?<=@)\s+", "", text)
+    # 型号/编号：短大写前缀与数字之间被拆开（X 1、SN 12345、USB 3）
+    text = re.sub(r"\b([A-Z]{1,4})\s+(\d{1,6})\b", r"\1\2", text)
+    return text
+
+
 # OCR 引擎懒加载缓存：只有真的遇到无文本页时才会初始化（首次会下载识别模型）
 _ocr_engine = None
 _ocr_error = ""
@@ -71,6 +92,8 @@ def _clean_text(text: str) -> str:
     text = text.replace("\n", "")
     # 压缩连续空格/制表符
     text = re.sub(r"[ \t]+", " ", text)
+    # 修复 PDF 排版导致的断字（邮箱、型号、编号等连续字符串）
+    text = _repair_broken_words(text)
     return text.strip()
 
 

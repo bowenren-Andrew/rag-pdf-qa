@@ -492,6 +492,32 @@ def get_document_file(user_id: int, document_id: int) -> bytes | None:
         return d.file_data if d else None
 
 
+def list_document_chunks_preview(
+    user_id: int, document_id: int, limit: int = 3
+) -> list[dict]:
+    """
+    读取一个文档的前几个片段，供界面展示切分结果与 OCR 文本。
+    只查 text/page，不取向量，避免预览带来额外的内存开销。
+    """
+    if limit <= 0:
+        return []
+    with session_scope() as db:
+        rows = (
+            db.query(DocumentChunk)
+            .filter(
+                DocumentChunk.user_id == user_id,
+                DocumentChunk.document_id == document_id,
+            )
+            .order_by(DocumentChunk.chunk_index.asc())
+            .limit(limit)
+            .all()
+        )
+        return [
+            {"index": r.chunk_index, "page": r.page, "text": r.text}
+            for r in rows
+        ]
+
+
 def delete_document_record(user_id: int, document_id: int) -> int:
     """
     删除一个文档及其全部片段、摘要与会话绑定（只能删自己的）。

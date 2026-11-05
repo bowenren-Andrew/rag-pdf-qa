@@ -47,6 +47,29 @@ def test_clean_text_空字符串返回空字符串():
     assert _clean_text("") == ""
 
 
+def test_clean_text_修复邮箱断字():
+    """BUG-10：PDF 把 support 拆成 suppor t 时，提取后应还原连续邮箱。"""
+    out = _clean_text("客服邮箱：suppor t@xinglan-demo.example。")
+    assert out == "客服邮箱：support@xinglan-demo.example。"
+
+
+def test_clean_text_修复邮箱符号两侧空白():
+    """@ 前后被排版空格隔开时也应合并，保证邮箱可直接复制使用。"""
+    out = _clean_text("联系 support @ example.com 获取帮助。")
+    assert out == "联系 support@example.com 获取帮助。"
+
+
+def test_clean_text_修复型号和编号断字():
+    """BUG-10：型号/编号中的短大写前缀与数字被拆开时应合并。"""
+    out = _clean_text("型号 X 1，序列号 SN 12345。")
+    assert out == "型号 X1，序列号 SN12345。"
+
+
+def test_clean_text_不误合并正常英文词组():
+    """只修复低风险断字模式，正常的英文单词间隔必须保留。"""
+    assert _clean_text("Hello world and Product 2") == "Hello world and Product 2"
+
+
 # ---------------- _split_sentences ----------------
 
 def test_split_sentences_按中文句末标点切句并保留标点():
