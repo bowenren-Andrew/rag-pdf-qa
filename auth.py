@@ -6,6 +6,7 @@ auth.py（v3）
         校验用 hmac.compare_digest 做定长时间比较，避免时序侧信道。
 - 用户的 DeepSeek Key：用 cryptography 的 Fernet 对称加密后落库，密钥来自环境变量 APP_SECRET_KEY。
 - 所有面向用户的失败原因都抛出 AuthFriendlyError（中文提示），界面层直接展示。
+- 登录限流：连续失败 5 次按账号锁定 15 分钟（进程内计数，重启后清零）。
 """
 import hashlib
 import hmac
