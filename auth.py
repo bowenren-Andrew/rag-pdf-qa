@@ -23,6 +23,11 @@ PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
 PBKDF2_ITERATIONS = 480_000
 _USERNAME_RE = re.compile(r"^[A-Za-z0-9_]{3,20}$")
 
+# DeepSeek Key 格式：sk- 前缀 + 17–125 位字母/数字/短横线/下划线（总长 20–128）
+_API_KEY_RE = re.compile(r"^sk-[A-Za-z0-9_-]{17,125}$")
+API_KEY_MIN_LEN = 20
+API_KEY_MAX_LEN = 128
+
 
 class AuthFriendlyError(Exception):
     """面向用户的中文友好错误，界面直接 str(e) 展示即可。"""
@@ -93,6 +98,25 @@ def validate_password(password: str) -> tuple[bool, str]:
     """密码规则：至少 8 位。"""
     if not password or len(password) < 8:
         return False, "密码至少需要 8 位。"
+    return True, ""
+
+
+def validate_api_key_format(key: str) -> tuple[bool, str]:
+    """只校验 DeepSeek Key 的格式（前缀 + 长度 + 字符集），不发起网络请求。"""
+    key = (key or "").strip()
+    if not key:
+        return False, "请输入要保存的 API Key。"
+    if not key.startswith("sk-"):
+        return False, "Key 格式不正确：应以 sk- 开头，请检查后重新填写。"
+    if not API_KEY_MIN_LEN <= len(key) <= API_KEY_MAX_LEN:
+        return False, (
+            f"Key 长度不正确（应为 {API_KEY_MIN_LEN}–{API_KEY_MAX_LEN} 位），"
+            "请检查后重新填写。"
+        )
+    if not _API_KEY_RE.match(key):
+        return False, (
+            "Key 格式不正确：只能包含字母、数字、短横线和下划线，请检查后重新填写。"
+        )
     return True, ""
 
 
@@ -212,8 +236,9 @@ def get_user_api_key(user_id: int) -> str:
 def set_user_api_key(user_id: int, plain: str) -> str:
     """加密保存用户的 API Key，返回掩码形式用于界面回显。"""
     plain = (plain or "").strip()
-    if not plain:
-        raise AuthFriendlyError("请输入要保存的 API Key。")
+    ok, msg = validate_api_key_format(plain)
+    if not ok:
+        raise AuthFriendlyError(msg)
     db.update_api_key_enc(user_id, encrypt_key(plain))
     return mask_key(plain)
 

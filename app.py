@@ -19,14 +19,15 @@ app.py（v3.3）
 会话数据存放在数据库（见 db.py），不再使用本地 JSON 文件。
 运行方式：streamlit run app.py
 """
+import logging
 import os
 
 import streamlit as st
 
 import auth
 import db
-from loader import load_and_split_file
-from qa import QAFriendlyError, generate_doc_brief, stream_answer
+from loader import FileParseError, load_and_split_file
+from qa import QAFriendlyError, generate_doc_brief, stream_answer, verify_api_key
 from vectorstore import (
     add_document,
     delete_document,
@@ -35,6 +36,8 @@ from vectorstore import (
     save_document_summary,
     similarity_search,
 )
+
+logger = logging.getLogger(__name__)
 
 # 原始文件字节入库上限：超过则不存原始文件（片段与摘要仍会持久化），
 # 避免撑爆 Supabase 免费版数据库（500MB）
@@ -218,6 +221,89 @@ render_sidebar_user()
 USER_ID = st.session_state.user["id"]
 
 
+def _drop_doc_from_session_state(doc_id: int, name: str):
+    """文档删除后同步清理内存里的摘要与绑定，避免界面继续引用已删文档。"""
+    st.session_state.doc_briefs.pop(name, None)
+    st.session_state.session_doc_ids = [
+        i for i in st.session_state.get("session_doc_ids", []) if i != doc_id
+    ]
+    st.session_state.pending_doc_ids = [
+        i for i in st.session_state.get("pending_doc_ids", []) if i != doc_id
+    ]
+    st.session_state.session_scope_names = [
+        n for n in st.session_state.get("session_scope_names", []) if n != name
+    ]
+
+
+@st.dialog("确认删除文档")
+def _confirm_delete_document():
+    """删除文档前的二次确认：确认后才删片段、摘要、原始文件与会话绑定。"""
+    target = st.session_state.get("pending_delete_doc") or {}
+    name = target.get("name", "")
+    if not name:
+        st.session_state.pending_delete_doc = None
+        st.rerun()
+
+    st.write(f"确定要删除《{name}》吗？")
+    st.caption(
+        "该文档的全部片段、摘要、原始文件与会话绑定将一并从数据库删除，"
+        "删除后无法恢复。"
+    )
+    confirm_col, cancel_col = st.columns(2)
+    if confirm_col.button(
+        "确认删除", type="primary", use_container_width=True, key="confirm_doc_delete"
+    ):
+        try:
+            removed = delete_document(USER_ID, name)
+            _drop_doc_from_session_state(target.get("id"), name)
+            st.session_state.pending_delete_doc = None
+            st.session_state.doc_flash = (
+                f"已删除《{name}》（{removed} 个片段），可重新上传。"
+                if removed
+                else f"《{name}》已不存在。"
+            )
+            st.rerun()
+        except Exception:
+            logger.exception("删除文档《%s》失败", name)
+            st.error("删除失败，请稍后重试。")
+    if cancel_col.button("取消", use_container_width=True, key="cancel_doc_delete"):
+        st.session_state.pending_delete_doc = None
+        st.rerun()
+
+
+@st.dialog("确认删除会话")
+def _confirm_delete_session():
+    """删除历史会话前的二次确认：会话记录与会话-文档绑定一起删除。"""
+    target = st.session_state.get("pending_delete_session") or {}
+    session_id = target.get("id")
+    title = target.get("title") or "未命名会话"
+    if not session_id:
+        st.session_state.pending_delete_session = None
+        st.rerun()
+
+    st.write(f"确定要删除会话「{title}」吗？")
+    st.caption(
+        "该会话的全部聊天记录与会话-文档绑定将一并删除，删除后无法恢复"
+        "（知识库里的文档本身不会被删除）。"
+    )
+    confirm_col, cancel_col = st.columns(2)
+    if confirm_col.button(
+        "确认删除", type="primary", use_container_width=True, key="confirm_session_delete"
+    ):
+        try:
+            db.delete_session(USER_ID, session_id)
+            if session_id == st.session_state.session_id:
+                _reset_chat_state()
+            st.session_state.pending_delete_session = None
+            st.rerun()
+        except Exception:
+            logger.exception("删除会话 %s 失败", session_id)
+            st.error("删除失败，请稍后重试。")
+    if cancel_col.button("取消", use_container_width=True, key="cancel_session_delete"):
+        st.session_state.pending_delete_session = None
+        st.rerun()
+
+
 def _current_api_key() -> str:
     """读取当前用户解密后的 DeepSeek Key；未设置返回空字符串。"""
     try:
@@ -344,10 +430,14 @@ def page_chat():
                     _load_session_docs(loaded["id"])  # 恢复该会话的文档与摘要
                     st.rerun()
             if cols[2].button("删除", key=f"del_{s['id']}"):
-                db.delete_session(USER_ID, s["id"])  # 只能删自己的（绑定随之清理）
-                if s["id"] == st.session_state.session_id:
-                    _reset_chat_state()
-                st.rerun()
+                # 只记录待删目标，弹窗确认后才真正删除
+                st.session_state.pending_delete_session = {
+                    "id": s["id"],
+                    "title": s.get("title") or "未命名会话",
+                }
+
+    if st.session_state.get("pending_delete_session"):
+        _confirm_delete_session()
 
     # v3.3：本会话检索范围——多选自己的文档，检索只查选中的；
     # 加载旧会话时默认选中该会话绑定的文档；没绑定过则默认全部
@@ -510,10 +600,25 @@ def page_documents():
         "支持 PDF（含扫描件，图片页会自动 OCR 识别）与 PPTX；"
         "上传的文档只会进入你自己的知识库，其他用户看不到。"
     )
+    flash = st.session_state.pop("doc_flash", None)
+    if flash:
+        st.success(flash)
 
     uploaded_files = st.file_uploader(
-        "上传 PDF 或 PPTX（可多选）", type=["pdf", "pptx"], accept_multiple_files=True
+        "上传 PDF 或 PPTX（可多选）",
+        accept_multiple_files=True,
+        help="仅支持 PDF 与 PPTX；其他格式会在提交时提示，不会入库。",
     )
+    # 不在 file_uploader 里限制 type：Streamlit 自带的英文报错无法改成中文，
+    # 改为选中后由我们校验后缀并给出中文提示。
+    unsupported_uploads = [
+        f
+        for f in (uploaded_files or [])
+        if os.path.splitext(f.name)[1].lower() not in (".pdf", ".pptx")
+    ]
+    if unsupported_uploads:
+        names = "、".join(f"《{f.name}》" for f in unsupported_uploads)
+        st.warning(f"{names}格式不支持，仅支持 PDF 与 PPTX，请移除后重新上传。")
 
     # 强制全文 OCR 开关：默认关闭，勾选后对 PDF 的每一页都做 OCR（对 PPTX 无效）
     force_ocr = False
@@ -531,6 +636,9 @@ def page_documents():
     if uploaded_files and st.button("解析并入库", type="primary"):
         api_key = _current_api_key()  # 摘要生成需要 Key，没有则跳过摘要
         for f in uploaded_files:
+            if os.path.splitext(f.name)[1].lower() not in (".pdf", ".pptx"):
+                st.warning(f"《{f.name}》格式不支持，仅支持 PDF 与 PPTX，已跳过。")
+                continue
             with st.spinner(f"正在处理《{f.name}》…"):
                 if document_exists(USER_ID, f.name):
                     st.info(f"《{f.name}》已入库，跳过。如需重新处理，请先删除它。")
@@ -541,11 +649,13 @@ def page_documents():
                     chunks = load_and_split_file(
                         f, f.name, ocr_report=ocr_report, force_ocr=force_ocr
                     )
-                except ValueError as e:
-                    st.warning(str(e))
-                    continue
-                except Exception as e:
+                except FileParseError as e:
                     st.error(f"《{f.name}》解析失败：{e}")
+                    continue
+                except Exception:
+                    # 底层异常原文只进日志，界面只给可操作的中文提示
+                    logger.exception("解析《%s》失败", f.name)
+                    st.error(f"《{f.name}》解析失败：文件无法读取，请确认文件完好后重试。")
                     continue
 
                 if not chunks:
@@ -568,7 +678,8 @@ def page_documents():
                     pages = "、".join(str(p) for p in ocr_report["ocr_failed"])
                     st.warning(f"第 {pages} 页为图片且识别失败，已跳过。")
                 if ocr_report.get("ocr_error") and not ocr_report.get("ocr_pages"):
-                    st.warning(f"OCR 未启用（{ocr_report['ocr_error']}），图片页内容可能被跳过。")
+                    logger.warning("《%s》OCR 不可用：%s", f.name, ocr_report["ocr_error"])
+                    st.warning("OCR 未启用（图片识别组件不可用），图片页内容可能被跳过。")
 
                 try:
                     n = add_document(
@@ -583,8 +694,9 @@ def page_documents():
                         st.info(f"《{f.name}》已入库，跳过。如需重新处理，请先删除它。")
                         continue
                     st.success(f"《{f.name}》入库完成：{n} 个片段（已持久化，重启不丢失）")
-                except Exception as e:
-                    st.error(f"《{f.name}》入库失败：{e}")
+                except Exception:
+                    logger.exception("《%s》入库失败", f.name)
+                    st.error(f"《{f.name}》入库失败，请稍后重试。")
                     continue
 
                 # v3.3：会话还没创建（首次提问才会创建）时先记下，创建后立即绑定
@@ -610,8 +722,9 @@ def page_documents():
                     save_document_summary(USER_ID, f.name, brief)  # 持久化
                 except QAFriendlyError as e:
                     st.warning(f"《{f.name}》摘要生成失败：{e}")
-                except Exception as e:
-                    st.warning(f"《{f.name}》摘要生成失败：{e}")
+                except Exception:
+                    logger.exception("《%s》摘要生成失败", f.name)
+                    st.warning(f"《{f.name}》已入库，但摘要生成失败，可稍后重试。")
 
     st.divider()
     docs = list_document_details(USER_ID)
@@ -635,28 +748,11 @@ def page_documents():
             + (f" · {size_mb:.1f}MB" if size_mb >= 0.1 else "")
         )
         if cols[1].button("删除", key=f"del_doc_{name}"):
-            try:
-                removed = delete_document(USER_ID, name)
-                st.session_state.doc_briefs.pop(name, None)
-                # 同步清理本地记录的绑定状态
-                st.session_state.session_doc_ids = [
-                    i for i in st.session_state.get("session_doc_ids", []) if i != d["id"]
-                ]
-                st.session_state.pending_doc_ids = [
-                    i for i in st.session_state.get("pending_doc_ids", []) if i != d["id"]
-                ]
-                if removed:
-                    st.session_state.session_scope_names = [
-                        n for n in st.session_state.get("session_scope_names", []) if n != name
-                    ]
-                st.success(
-                    f"已删除《{name}》（{removed} 个片段），可重新上传。"
-                    if removed
-                    else f"《{name}》已不存在。"
-                )
-                st.rerun()
-            except Exception as e:
-                st.error(f"删除失败：{e}")
+            # 只记录待删目标，弹窗确认后才真正删除
+            st.session_state.pending_delete_doc = {"id": d["id"], "name": name}
+
+    if st.session_state.get("pending_delete_doc"):
+        _confirm_delete_document()
 
 
 # ---------- 页面三：⚙️ 设置 ----------
@@ -690,10 +786,17 @@ def page_settings():
         saved = st.form_submit_button("保存 Key", type="primary")
     if saved:
         try:
+            # 先校验格式，再调一次轻量鉴权接口（GET /models，不消耗 token），
+            # 两步都通过才加密落库，避免把坏 Key 存进去。
+            ok, msg = auth.validate_api_key_format(new_key)
+            if not ok:
+                raise auth.AuthFriendlyError(msg)
+            with st.spinner("正在验证 Key 是否有效…"):
+                verify_api_key(new_key)
             masked = auth.set_user_api_key(USER_ID, new_key)
-            st.success(f"Key 已加密保存（{masked}）")
+            st.success(f"Key 已验证并加密保存（{masked}）")
             st.rerun()
-        except auth.AuthFriendlyError as e:
+        except (auth.AuthFriendlyError, QAFriendlyError) as e:
             st.error(str(e))
 
     if current_key and st.button("删除已保存的 Key"):

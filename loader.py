@@ -13,11 +13,14 @@ v3.2 新增：force_ocr 参数——针对 LaTeX 导出的公式类 PDF（有文
 整页字数远超阈值）提供"强制全文 OCR"开关；不勾选时行为与 v3.1 完全一致。
 """
 import io
+import logging
 import os
 import re
 from typing import IO, Union
 
 from PyPDF2 import PdfReader
+
+logger = logging.getLogger(__name__)
 
 # 切分参数：每段目标长度 / 段间重叠长度（单位：字符）
 CHUNK_SIZE = 500
@@ -29,6 +32,27 @@ MIN_TEXT_LEN = 10
 OCR_ZOOM = 2.0
 # 目前支持的文件后缀（小写）
 SUPPORTED_EXTS = ("pdf", "pptx")
+
+# 面向用户的中文错误文案：底层异常原文只写日志，不展示给用户
+MSG_EMPTY_FILE = "文件为空，请重新上传。"
+MSG_BROKEN_PDF = "文件已损坏或不是有效的 PDF，请重新上传。"
+MSG_ENCRYPTED_PDF = "该 PDF 已加密，请解除密码后重新上传。"
+MSG_BROKEN_PPTX = "文件已损坏或不是有效的 PPTX，请重新上传。"
+
+
+class FileParseError(ValueError):
+    """文件解析失败的中文错误（继承 ValueError，兼容既有调用与测试）。"""
+
+
+def _pdf_error_message(error: Exception) -> str:
+    """按 PyPDF2 抛出的异常文本归类为中文提示。"""
+    text = str(error).lower()
+    if "empty file" in text:
+        return MSG_EMPTY_FILE
+    if "decrypt" in text or "encrypt" in text:
+        return MSG_ENCRYPTED_PDF
+    return MSG_BROKEN_PDF
+
 
 # OCR 引擎懒加载缓存：只有真的遇到无文本页时才会初始化（首次会下载识别模型）
 _ocr_engine = None
@@ -181,7 +205,17 @@ def load_and_split_pdf(
                       单页 OCR 失败会回退到该页提取到的文本，失败绝不中断整文件。
     :return: [{"text": 片段文本, "page": 页码(从1开始)}, ...]
     """
-    reader = PdfReader(file)
+    try:
+        reader = PdfReader(file)
+    except Exception as e:
+        logger.warning("PDF 读取失败：%s", e)
+        raise FileParseError(_pdf_error_message(e)) from e
+
+    # 加密 PDF 在取页文本时会抛 "File has not been decrypted"，
+    # 这里提前识别，给出可操作的提示。
+    if getattr(reader, "is_encrypted", False) is True:
+        raise FileParseError(MSG_ENCRYPTED_PDF)
+
     results = []
     pending_ocr = []  # 待 OCR 的页：(页码, 该页原本提取到的文本，用作失败回退)
 
@@ -193,7 +227,12 @@ def load_and_split_pdf(
             results.append({"text": chunk, "page": page_no})
 
     for page_no, page in enumerate(reader.pages, start=1):
-        cleaned = _clean_text(page.extract_text() or "")
+        try:
+            raw_text = page.extract_text() or ""
+        except Exception as e:
+            logger.warning("PDF 第 %s 页文本提取失败：%s", page_no, e)
+            raise FileParseError(_pdf_error_message(e)) from e
+        cleaned = _clean_text(raw_text)
         if force_ocr:
             # 强制模式：每一页都送进 OCR，提取到的文本只留作失败回退
             pending_ocr.append((page_no, cleaned))
@@ -299,7 +338,13 @@ def load_and_split_pptx(file: Union[str, IO[bytes]]) -> list[dict]:
     from pptx import Presentation
 
     data = _read_file_bytes(file)
-    prs = Presentation(io.BytesIO(data))
+    if not data:
+        raise FileParseError(MSG_EMPTY_FILE)
+    try:
+        prs = Presentation(io.BytesIO(data))
+    except Exception as e:
+        logger.warning("PPTX 读取失败：%s", e)
+        raise FileParseError(MSG_BROKEN_PPTX) from e
     results = []
     for slide_no, slide in enumerate(prs.slides, start=1):
         parts = []
@@ -327,8 +372,17 @@ def load_and_split_file(
     :raises ValueError: 遇到不支持的后缀
     """
     ext = os.path.splitext(filename or "")[1].lower().lstrip(".")
-    if ext == "pdf":
-        return load_and_split_pdf(file, ocr_report=ocr_report, force_ocr=force_ocr)
-    if ext == "pptx":
+    if ext not in SUPPORTED_EXTS:
+        raise FileParseError(
+            f"不支持的文件类型：.{ext or '未知'}。仅支持 PDF 与 PPTX，请重新上传。"
+        )
+    try:
+        if ext == "pdf":
+            return load_and_split_pdf(file, ocr_report=ocr_report, force_ocr=force_ocr)
         return load_and_split_pptx(file)
-    raise ValueError(f"不支持的文件类型：.{ext or '未知'}（目前支持 pdf / pptx）")
+    except FileParseError:
+        raise
+    except Exception as e:
+        # 兜底：任何未预料的底层异常都不把英文原文暴露给用户
+        logger.warning("解析《%s》失败：%s", filename, e)
+        raise FileParseError(MSG_BROKEN_PPTX if ext == "pptx" else MSG_BROKEN_PDF) from e

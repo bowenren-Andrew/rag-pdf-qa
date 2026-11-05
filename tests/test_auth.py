@@ -138,8 +138,9 @@ def test_修改密码需要正确的旧密码(tmp_db):
 def test_用户Key存取与删除(tmp_db, fernet_key):
     """设置页保存的 Key 应能解密读回，删除后读为空字符串。"""
     user = auth.register("dave", "DavePass123")["user"]
-    auth.set_user_api_key(user["id"], "sk-dave-secret-key")
-    assert auth.get_user_api_key(user["id"]) == "sk-dave-secret-key"
+    key = "sk-" + "d" * 32
+    auth.set_user_api_key(user["id"], key)
+    assert auth.get_user_api_key(user["id"]) == key
 
     auth.delete_user_api_key(user["id"])
     assert auth.get_user_api_key(user["id"]) == ""
@@ -148,7 +149,39 @@ def test_用户Key存取与删除(tmp_db, fernet_key):
 def test_密文确实写进了数据库(tmp_db, fernet_key):
     """落库的必须是密文，不能直接是明文 Key。"""
     user = auth.register("erin", "ErinPass123")["user"]
-    auth.set_user_api_key(user["id"], "sk-erin-plain-key")
+    key = "sk-" + "e" * 32
+    auth.set_user_api_key(user["id"], key)
     stored = db.get_user_by_id(user["id"])
-    assert stored["api_key_enc"] != "sk-erin-plain-key"
-    assert "sk-erin-plain-key" not in stored["api_key_enc"]
+    assert stored["api_key_enc"] != key
+    assert key not in stored["api_key_enc"]
+
+
+# ---------------- API Key 格式校验（BUG-04） ----------------
+@pytest.mark.parametrize(
+    "key, ok",
+    [
+        ("sk-" + "a" * 32, True),          # 正常的 DeepSeek Key 形态
+        ("sk-ab_" + "b" * 28, True),       # 允许下划线/短横线
+        ("abc", False),                    # 缺少 sk- 前缀
+        ("", False),                       # 空输入
+        ("pk-" + "a" * 32, False),         # 前缀不对
+        ("sk-short", False),               # 长度不足
+        ("sk-" + "a" * 200, False),        # 长度超限
+        ("sk-" + "a" * 30 + "!", False),   # 含非法字符
+    ],
+)
+def test_API_Key格式校验(key, ok):
+    """保存前只放行 sk- 前缀、合理长度、合法字符集的 Key。"""
+    assert auth.validate_api_key_format(key)[0] is ok
+
+
+def test_保存非法Key被拒绝且不落库(tmp_db, fernet_key):
+    """abc 这类非法 Key 必须在落库前被拒绝，并给出明确的中文提示。"""
+    user = auth.register("frank", "FrankPass123")["user"]
+
+    with pytest.raises(auth.AuthFriendlyError) as exc:
+        auth.set_user_api_key(user["id"], "abc")
+
+    assert "sk-" in str(exc.value)
+    assert auth.get_user_api_key(user["id"]) == ""
+    assert db.get_user_by_id(user["id"])["api_key_enc"] is None

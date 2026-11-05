@@ -15,6 +15,7 @@ qa.py（v3.1）
 - 所有失败都抛出 QAFriendlyError（中文友好提示），由界面层展示，程序不崩溃。
 """
 import json
+import logging
 import os
 import re
 from typing import Iterator
@@ -31,6 +32,8 @@ from openai import (
 # DeepSeek 官方接口（OpenAI 兼容）
 BASE_URL = "https://api.deepseek.com"
 MODEL = "deepseek-chat"
+
+logger = logging.getLogger(__name__)
 
 # 项目根目录 = 本文件所在目录，.env 与 app.py 同级
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -65,6 +68,45 @@ def _require_client(api_key: str = None) -> OpenAI:
             "未检测到 API Key。请到「⚙️ 设置」页填写你自己的 DeepSeek Key 后再提问。"
         )
     return OpenAI(api_key=key, base_url=BASE_URL, timeout=60)
+
+
+def verify_api_key(api_key: str) -> None:
+    """
+    用 GET /models 做一次轻量鉴权：只验证 Key，不消耗 token、不生成内容。
+    :raises QAFriendlyError: Key 无效、无权限、网络失败或接口异常（均为中文提示）
+    """
+    key = (api_key or "").strip()
+    if not key:
+        raise QAFriendlyError("请输入要保存的 API Key。")
+    client = OpenAI(api_key=key, base_url=BASE_URL, timeout=10, max_retries=0)
+    try:
+        client.models.list()
+    except AuthenticationError as e:
+        raise QAFriendlyError(
+            "Key 校验失败：该 Key 无效或已过期，请确认后重新填写。"
+        ) from e
+    except APITimeoutError as e:
+        raise QAFriendlyError(
+            "Key 校验超时，请检查网络后重试（Key 未保存）。"
+        ) from e
+    except APIConnectionError as e:
+        raise QAFriendlyError(
+            "无法连接 DeepSeek 校验 Key，请检查网络后重试（Key 未保存）。"
+        ) from e
+    except APIStatusError as e:
+        if e.status_code in (401, 403):
+            raise QAFriendlyError(
+                "Key 校验失败：该 Key 无效或没有访问权限，请确认后重新填写。"
+            ) from e
+        raise QAFriendlyError(
+            f"Key 校验失败：DeepSeek 接口返回 HTTP {e.status_code}，"
+            "请稍后重试（Key 未保存）。"
+        ) from e
+    except Exception as e:
+        logger.warning("校验 DeepSeek Key 失败：%s", e)
+        raise QAFriendlyError(
+            "Key 校验失败：无法完成验证，请稍后重试（Key 未保存）。"
+        ) from e
 
 
 # 多轮对话历史的字符上限：超出时从最旧的消息开始丢弃，最近一轮问答一定保留
