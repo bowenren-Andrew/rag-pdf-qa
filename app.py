@@ -99,6 +99,8 @@ from qa import (  # noqa: E402
     verify_api_key,
 )
 from ui_helpers import (  # noqa: E402
+    ask_banner_text,
+    mark_ask_pending,
     parse_progress_fraction,
     parse_progress_label,
     reveal_on_first_chunk,
@@ -528,9 +530,22 @@ def _parse_progress(filename: str):
 
 
 # ---------- 页面一：💬 问答 ----------
+def _on_send_click():
+    """发送按钮的 on_click 回调：重跑前先记下待提问内容。"""
+    mark_ask_pending(st.session_state, st.session_state.get("question_input"))
+
+
 def page_chat():
     """问答页：聊天窗口、流式回答、引用来源、摘要推荐问题、会话管理。"""
     st.markdown('<div class="title-divider"></div>', unsafe_allow_html=True)
+
+    # P3：点击「发送」后 Streamlit 要重跑整个脚本（线上约 3–4 秒）才会渲染到聊天区，
+    # 这段时间页面顶部先给出「思考中」，避免看起来没反应。
+    _ask_banner = None
+    _pending_question = st.session_state.pop("ask_pending", None)
+    if _pending_question:
+        _ask_banner = st.empty()
+        _ask_banner.markdown(ask_banner_text(_pending_question))
 
     # 上一轮成功提交后清空输入框：必须在 text_area 实例化之前修改 key
     if st.session_state.pop("_clear_question_input", False):
@@ -643,6 +658,10 @@ def page_chat():
                     if st.button(q, key=f"sug_{name}_{i}"):
                         st.session_state.pending_question = q
 
+    # 聊天区马上渲染（内部还有「思考中」占位），顶部临时提示到此交接，避免重复。
+    if _ask_banner is not None:
+        _ask_banner.empty()
+
     st.subheader(f"💬 当前会话：{st.session_state.session_title}")
     # P3：让用户随时看到当前请求的模型名；每轮回答后另附 API 实际返回的用量与估算费用。
     st.caption(
@@ -682,6 +701,7 @@ def page_chat():
         type="primary",
         use_container_width=True,
         disabled=not typed.strip() or too_long,
+        on_click=_on_send_click,
     )
     if submitted:
         typed = (typed or "").strip()

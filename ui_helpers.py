@@ -62,3 +62,28 @@ def reveal_on_first_chunk(stream, on_first=None, on_finish=None):
     finally:
         if on_finish is not None:
             on_finish()
+
+
+ASK_BANNER_MAX_CHARS = 24
+
+
+def ask_banner_text(question: str) -> str:
+    """
+    页面顶部「思考中」提示的文案。
+    点击发送后 Streamlit 要重跑整个脚本才会渲染到聊天区（线上约 3–4 秒），
+    这段时间先由顶部提示承担反馈；问题过长时截断，避免撑开布局。
+    """
+    text = " ".join((question or "").split())
+    if len(text) > ASK_BANNER_MAX_CHARS:
+        text = text[:ASK_BANNER_MAX_CHARS] + "…"
+    return f"⏳ **思考中…** 正在准备回答：{text}"
+
+
+def mark_ask_pending(state, question) -> None:
+    """
+    把「刚点击发送」的问题记到会话状态里，供下一次重跑在页面顶部先给反馈。
+    只写入非空问题；空问题（按钮本应禁用）不记录，避免留下无意义的提示。
+    """
+    text = (question or "").strip()
+    if text:
+        state["ask_pending"] = text
