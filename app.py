@@ -100,6 +100,7 @@ from qa import (  # noqa: E402
 )
 from ui_helpers import (  # noqa: E402
     ask_banner_text,
+    escape_markdown,
     mark_ask_pending,
     parse_progress_fraction,
     parse_progress_label,
@@ -340,7 +341,7 @@ def _confirm_delete_document():
         st.session_state.pending_delete_doc = None
         st.rerun()
 
-    st.write(f"确定要删除《{name}》吗？")
+    st.write(f"确定要删除《{escape_markdown(name)}》吗？")
     st.caption(
         "该文档的全部片段、摘要、原始文件与会话绑定将一并从数据库删除，"
         "删除后无法恢复。"
@@ -354,9 +355,9 @@ def _confirm_delete_document():
             _drop_doc_from_session_state(target.get("id"), name)
             st.session_state.pending_delete_doc = None
             st.session_state.doc_flash = (
-                f"已删除《{name}》（{removed} 个片段），可重新上传。"
+                f"已删除《{escape_markdown(name)}》（{removed} 个片段），可重新上传。"
                 if removed
-                else f"《{name}》已不存在。"
+                else f"《{escape_markdown(name)}》已不存在。"
             )
             st.rerun()
         except Exception:
@@ -428,7 +429,7 @@ def render_sources(sources: list[dict]):
             sim = max(0.0, 1.0 - float(s["score"])) * 100
             unit = "张" if s.get("doc_type") == "pptx" else "页"
             st.markdown(
-                f"**【片段{i}】** {s['source']} · 第 {s['page']} {unit} · 相似度 **{sim:.1f}%**"
+                f"**【片段{i}】** {escape_markdown(s['source'])} · 第 {s['page']} {unit} · 相似度 **{sim:.1f}%**"
             )
             st.caption(s["text"])
             st.progress(min(max(sim / 100.0, 0.0), 1.0))
@@ -501,7 +502,7 @@ def _parse_progress(filename: str):
     - 进度值按真实页数推进（抽取 5%–65%，OCR 70%–90%），不是假进度条；
     - 同时给出耗时预期；退出时（成功/失败/跳过）自动清掉进度与提示。
     """
-    bar = st.progress(0.0, text=f"准备解析《{filename}》…")
+    bar = st.progress(0.0, text=f"准备解析《{escape_markdown(filename)}》…")
     hint = st.caption(
         "解析通常需要 10 秒左右，大文件或扫描页更多时会更久；"
         "下方进度按实际页数推进。"
@@ -640,7 +641,7 @@ def page_chat():
 
     # 主区：上次入库生成的摘要与推荐问题
     for name, brief in st.session_state.doc_briefs.items():
-        with st.expander(f"📝 《{name}》全文摘要与推荐问题", expanded=False):
+        with st.expander(f"📝 《{escape_markdown(name)}》全文摘要与推荐问题", expanded=False):
             st.markdown(brief.get("summary", ""))
             if brief.get("usage"):
                 st.caption("📊 摘要生成 · " + format_usage(brief["usage"]))
@@ -838,7 +839,7 @@ def page_documents():
         if os.path.splitext(f.name)[1].lower() not in (".pdf", ".pptx")
     ]
     if unsupported_uploads:
-        names = "、".join(f"《{f.name}》" for f in unsupported_uploads)
+        names = "、".join(f"《{escape_markdown(f.name)}》" for f in unsupported_uploads)
         st.warning(f"{names}格式不支持，仅支持 PDF 与 PPTX，请移除后重新上传。")
 
     # 强制全文 OCR 开关：默认关闭，勾选后对 PDF 的每一页都做 OCR（对 PPTX 无效）
@@ -858,11 +859,11 @@ def page_documents():
         api_key = _current_api_key()  # 摘要生成需要 Key，没有则跳过摘要
         for f in uploaded_files:
             if os.path.splitext(f.name)[1].lower() not in (".pdf", ".pptx"):
-                st.warning(f"《{f.name}》格式不支持，仅支持 PDF 与 PPTX，已跳过。")
+                st.warning(f"《{escape_markdown(f.name)}》格式不支持，仅支持 PDF 与 PPTX，已跳过。")
                 continue
             with _parse_progress(f.name) as (progress_bar, on_progress):
                 if document_exists(USER_ID, f.name):
-                    st.info(f"《{f.name}》已入库，跳过。如需重新处理，请先删除它。")
+                    st.info(f"《{escape_markdown(f.name)}》已入库，跳过。如需重新处理，请先删除它。")
                     continue
                 try:
                     # 按后缀分发解析；OCR 情况写进 report，供下方提示使用
@@ -875,29 +876,29 @@ def page_documents():
                         on_progress=on_progress,
                     )
                 except FileParseError as e:
-                    st.error(f"《{f.name}》解析失败：{e}")
+                    st.error(f"《{escape_markdown(f.name)}》解析失败：{e}")
                     continue
                 except Exception:
                     # 底层异常原文只进日志，界面只给可操作的中文提示
                     logger.exception("解析《%s》失败", f.name)
-                    st.error(f"《{f.name}》解析失败：文件无法读取，请确认文件完好后重试。")
+                    st.error(f"《{escape_markdown(f.name)}》解析失败：文件无法读取，请确认文件完好后重试。")
                     continue
 
                 if not chunks:
                     # 只有全文完全没有可用文本时才这样提示（单个图片页失败另有提示）
-                    st.warning(f"《{f.name}》未提取到任何可用文本，已跳过。")
+                    st.warning(f"《{escape_markdown(f.name)}》未提取到任何可用文本，已跳过。")
                     continue
 
                 # OCR 结果提示：识别成功的页与识别失败被跳过的页
                 if ocr_report.get("ocr_pages"):
                     if ocr_report.get("ocr_mode") == "force":
                         st.info(
-                            f"《{f.name}》已强制全文 OCR，"
+                            f"《{escape_markdown(f.name)}》已强制全文 OCR，"
                             f"共 {len(ocr_report['ocr_pages'])} 页通过识别入库。"
                         )
                     else:
                         st.info(
-                            f"《{f.name}》有 {len(ocr_report['ocr_pages'])} 个图片页已通过 OCR 识别入库。"
+                            f"《{escape_markdown(f.name)}》有 {len(ocr_report['ocr_pages'])} 个图片页已通过 OCR 识别入库。"
                         )
                 if ocr_report.get("ocr_failed"):
                     pages = "、".join(str(p) for p in ocr_report["ocr_failed"])
@@ -918,12 +919,12 @@ def page_documents():
                         file_size=f.size,
                     )
                     if n == 0:
-                        st.info(f"《{f.name}》已入库，跳过。如需重新处理，请先删除它。")
+                        st.info(f"《{escape_markdown(f.name)}》已入库，跳过。如需重新处理，请先删除它。")
                         continue
-                    st.success(f"《{f.name}》入库完成：{n} 个片段（已持久化，重启不丢失）")
+                    st.success(f"《{escape_markdown(f.name)}》入库完成：{n} 个片段（已持久化，重启不丢失）")
                 except Exception:
                     logger.exception("《%s》入库失败", f.name)
-                    st.error(f"《{f.name}》入库失败，请稍后重试。")
+                    st.error(f"《{escape_markdown(f.name)}》入库失败，请稍后重试。")
                     continue
 
                 # v3.3：会话还没创建（首次提问才会创建）时先记下，创建后立即绑定
@@ -935,7 +936,7 @@ def page_documents():
                 # 入库后自动生成全文摘要 + 3 个推荐问题（只在该文档内检索），
                 # 生成结果持久化到文档上，随会话/文档恢复
                 if not api_key:
-                    st.info(f"《{f.name}》已入库；填写 API Key 后可自动生成摘要与推荐问题。")
+                    st.info(f"《{escape_markdown(f.name)}》已入库；填写 API Key 后可自动生成摘要与推荐问题。")
                     continue
                 progress_bar.progress(0.99, text="正在生成摘要与推荐问题…")
                 try:
@@ -955,10 +956,10 @@ def page_documents():
                     st.session_state.doc_briefs[f.name] = brief
                     save_document_summary(USER_ID, f.name, brief)  # 持久化
                 except QAFriendlyError as e:
-                    st.warning(f"《{f.name}》摘要生成失败：{e}")
+                    st.warning(f"《{escape_markdown(f.name)}》摘要生成失败：{e}")
                 except Exception:
                     logger.exception("《%s》摘要生成失败", f.name)
-                    st.warning(f"《{f.name}》已入库，但摘要生成失败，可稍后重试。")
+                    st.warning(f"《{escape_markdown(f.name)}》已入库，但摘要生成失败，可稍后重试。")
 
     st.divider()
     docs = list_document_details(USER_ID)
@@ -978,7 +979,7 @@ def page_documents():
         size_mb = (d.get("file_size") or 0) / (1024 * 1024)
         cols = st.columns([0.72, 0.28])
         cols[0].write(
-            f"{icon} {in_session}{name} · {d.get('chunk_count', 0)} 片段"
+            f"{icon} {in_session}{escape_markdown(name)} · {d.get('chunk_count', 0)} 片段"
             + (f" · {size_mb:.1f}MB" if size_mb >= 0.1 else "")
         )
         if cols[1].button("删除", key=f"del_doc_{name}"):
@@ -990,7 +991,7 @@ def page_documents():
         total = d.get("chunk_count", 0)
         if preview:
             with st.expander(
-                f"🔍 《{name}》片段预览（前 {len(preview)} / {total} 段）",
+                f"🔍 《{escape_markdown(name)}》片段预览（前 {len(preview)} / {total} 段）",
                 expanded=False,
             ):
                 st.caption("以下为入库后的实际片段文本；扫描件展示的是 OCR 后的结果。")
@@ -1046,9 +1047,19 @@ def page_settings():
         "申请地址：[platform.deepseek.com](https://platform.deepseek.com/)"
     )
 
+    # P3-2：保存成功或删除后清空 Key 输入框，避免明文留在前端 widget 状态里。
+    # 单独用标记位在 rerun 前排队，下一次渲染创建 widget 之前再清，避免
+    # Streamlit 禁止在 widget 实例化后修改其状态的限制。
+    if st.session_state.pop("_reset_api_key_input", False):
+        st.session_state.pop("new_api_key_input", None)
+
     with st.form("api_key_form"):
         new_key = st.text_input(
-            "填入新的 Key", type="password", placeholder="sk-...", help="保存后会覆盖旧 Key"
+            "填入新的 Key",
+            type="password",
+            placeholder="sk-...",
+            help="保存后会覆盖旧 Key",
+            key="new_api_key_input",
         )
         saved = st.form_submit_button("保存 Key", type="primary")
     if saved:
@@ -1061,6 +1072,7 @@ def page_settings():
             with st.spinner("正在验证 Key 是否有效…"):
                 verify_api_key(new_key)
             masked = auth.set_user_api_key(USER_ID, new_key)
+            st.session_state["_reset_api_key_input"] = True
             st.success(f"Key 已验证并加密保存（{masked}）")
             st.rerun()
         except (auth.AuthFriendlyError, QAFriendlyError) as e:
@@ -1068,6 +1080,7 @@ def page_settings():
 
     if current_key and st.button("删除已保存的 Key"):
         auth.delete_user_api_key(USER_ID)
+        st.session_state["_reset_api_key_input"] = True
         st.success("已删除保存的 Key，需要时可重新填写。")
         st.rerun()
 

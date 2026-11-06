@@ -6,7 +6,21 @@ ui_helpers.py（v3.4）
   (stage, done, total) 映射成进度值与阶段文案（按真实页数推进，不做假动效）；
 - reveal_on_first_chunk：包装流式生成器，首个 chunk 到达时回调、结束时必定回调，
   用于「思考中」占位在首字出现后消失、异常时也不残留。
+- escape_markdown（P3-1 安全加固）：转义用户提供的文件名里的 Markdown 控制字符，
+  避免被渲染成链接/图片/HTML，纯文本显示不变。
 """
+import re
+
+
+# P3-1：文件名会进入 st.write / st.markdown / st.info 等 Markdown 渲染点。
+# 转义这些行内控制字符后，[CLICK](url)、![IMG](url)、<script> 都只显示为纯文本。
+_MD_ESCAPE_RE = re.compile(r"([\\`*_\[\]()!<>~#|])")
+
+
+def escape_markdown(text) -> str:
+    """转义 Markdown 行内特殊字符（渲染后显示内容不变），用于文件名等用户输入。"""
+    return _MD_ESCAPE_RE.sub(lambda m: "\\" + m.group(1), str(text or ""))
+
 
 # 解析阶段在总进度里的区间：抽取 5%–65%，OCR 70%–90%，留给入库/摘要 95%+
 PARSE_BASE = 0.05

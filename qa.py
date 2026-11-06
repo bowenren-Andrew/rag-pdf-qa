@@ -58,6 +58,17 @@ BEIJING_TZ = dt.timezone(dt.timedelta(hours=8))
 logger = logging.getLogger(__name__)
 
 
+# P3-3：异常文本里可能带出 sk- 开头的密钥，统一在写日志/返回提示前替换。
+# 负向前瞻避免误伤 risks-management 这类普通单词。
+_SECRET_RE = re.compile(r"(?<![A-Za-z0-9_-])sk-[A-Za-z0-9_-]{8,}")
+_REDACTED_KEY = "sk-****"
+
+
+def redact_secrets(text) -> str:
+    """把文本中形如 sk-xxxx 的密钥明文替换为 sk-****，其余内容保持不变。"""
+    return _SECRET_RE.sub(_REDACTED_KEY, str(text if text is not None else ""))
+
+
 def _model_tier(model_name: str) -> str:
     """按响应里的模型名选择价目档位：带 pro 的走 Pro 价，其余按 Flash 价估算。"""
     return "pro" if "pro" in str(model_name or "").lower() else "flash"
@@ -230,7 +241,7 @@ def verify_api_key(api_key: str) -> None:
             "请稍后重试（Key 未保存）。"
         ) from e
     except Exception as e:
-        logger.warning("校验 DeepSeek Key 失败：%s", e)
+        logger.warning("校验 DeepSeek Key 失败：%s", redact_secrets(e))
         raise QAFriendlyError(
             "Key 校验失败：无法完成验证，请稍后重试（Key 未保存）。"
         ) from e
@@ -314,8 +325,10 @@ def _friendly(e: Exception) -> QAFriendlyError:
     if isinstance(e, APIConnectionError):
         return QAFriendlyError("无法连接 DeepSeek API，请检查网络或代理设置。")
     if isinstance(e, APIStatusError):
-        return QAFriendlyError(f"DeepSeek API 返回错误（HTTP {e.status_code}）：{e.message}")
-    return QAFriendlyError(f"调用 DeepSeek API 失败：{e}")
+        return QAFriendlyError(
+            f"DeepSeek API 返回错误（HTTP {e.status_code}）：{redact_secrets(e.message)}"
+        )
+    return QAFriendlyError(f"调用 DeepSeek API 失败：{redact_secrets(e)}")
 
 
 def generate_answer(
