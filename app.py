@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-app.py（v3.3）
+app.py（v3.4）
 职责：Streamlit 界面（单一职责：只做交互与展示，业务逻辑在 auth/db/loader/vectorstore/qa）。
 - v3 变更：新增账号体系（注册/登录）、session_state 保存当前用户；
           知识库与会话按 user_id 隔离；每位用户使用自己的 DeepSeek Key。
@@ -12,6 +12,10 @@ app.py（v3.3）
 - v3.3 变更（持久化）：文档与片段存数据库（Chroma 退役），云端重启后不丢；
           新增会话-文档绑定：加载旧会话恢复其文档列表与摘要；
           问答检索默认限定在本会话选定的文档内。
+- v3.4 变更（P3 体验层）：提问后先显示「思考中」占位，首字出现即消失；
+          解析时显示真实阶段进度（抽取 / OCR / 入库 / 摘要）与耗时预期；
+          应用内首屏加载骨架（平台休眠页不可改，见 README/交付说明）；
+          展示实际调用模型、每轮 token 用量与估算费用（问答与摘要）。
 - 页面结构（st.navigation 多页面）：
   1) 💬 问答      —— 聊天、流式回答、引用原文与相似度、文档摘要与推荐问题、会话管理
   2) 📁 我的文档  —— 上传 PDF / PPTX 入库（查重、存库）、已入库列表与删除
@@ -21,23 +25,9 @@ app.py（v3.3）
 """
 import logging
 import os
+from contextlib import contextmanager
 
 import streamlit as st
-
-import auth
-import db
-from loader import FileParseError, load_and_split_file
-from qa import QAFriendlyError, generate_doc_brief, stream_answer, verify_api_key
-from vectorstore import (
-    add_document,
-    delete_document,
-    document_exists,
-    list_document_details,
-    save_document_summary,
-    similarity_search,
-)
-
-logger = logging.getLogger(__name__)
 
 # 原始文件字节入库上限：超过则不存原始文件（片段与摘要仍会持久化），
 # 避免撑爆 Supabase 免费版数据库（500MB）
@@ -51,6 +41,25 @@ st.set_page_config(
     page_icon="📄",
     layout="wide",
     initial_sidebar_state="expanded",
+)
+
+# P3：首屏加载骨架。Streamlit Cloud 的「休眠唤醒」页由平台接管、应用层改不了；
+# 这里保证脚本一开始执行就先给出可见提示，覆盖后面 torch / sentence-transformers
+# 等重依赖的 import 时间（这些 import 原本发生在任何 st 输出之前，用户看到的是空白）。
+_boot_placeholder = st.empty()
+_boot_placeholder.markdown(
+    """
+    <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;
+                min-height:52vh;gap:12px;color:#6B7280;">
+      <div style="font-size:40px">📄</div>
+      <div style="font-size:18px;font-weight:600;color:#374151">正在加载 PDF 智能问答…</div>
+      <div style="font-size:13px">首次唤醒通常需要 10–20 秒，请稍候；之后会明显更快。</div>
+      <div style="width:220px;height:4px;border-radius:2px;background:#E5E7EB;overflow:hidden">
+        <div style="width:45%;height:100%;background:#2563EB;border-radius:2px"></div>
+      </div>
+    </div>
+    """,
+    unsafe_allow_html=True,
 )
 
 
@@ -73,11 +82,43 @@ def _sync_secrets_to_env():
 
 _sync_secrets_to_env()
 
+# 重依赖放在骨架屏之后 import（延迟首屏空白的开始时间，P3 冷启动优化）；
+# noqa 注释是刻意保留的：这里不能把这些 import 提到文件顶部。
+import auth  # noqa: E402
+import db  # noqa: E402
+from loader import FileParseError, load_and_split_file  # noqa: E402
+from qa import (  # noqa: E402
+    MODEL,
+    QAFriendlyError,
+    format_usage,
+    generate_doc_brief,
+    stream_answer,
+    verify_api_key,
+)
+from ui_helpers import (  # noqa: E402
+    parse_progress_fraction,
+    parse_progress_label,
+    reveal_on_first_chunk,
+)
+from vectorstore import (  # noqa: E402
+    add_document,
+    delete_document,
+    document_exists,
+    list_document_details,
+    save_document_summary,
+    similarity_search,
+)
+
+logger = logging.getLogger(__name__)
+
 try:
     db.init_db()
 except Exception as e:
+    _boot_placeholder.empty()
     st.error(f"数据库连接失败：{e}")
     st.stop()
+
+_boot_placeholder.empty()
 
 
 # ---------- 极少量自定义 CSS：只做圆角、分隔线与卡片阴影，不加动画 ----------
@@ -449,6 +490,37 @@ def _file_bytes_for_storage(f) -> bytes | None:
     return data
 
 
+def _file_unit(filename: str) -> str:
+    """解析进度里的页数单位：PPTX 用「张」，PDF 用「页」。"""
+    return "张" if os.path.splitext(filename)[1].lower() == ".pptx" else "页"
+
+
+@contextmanager
+def _parse_progress(filename: str):
+    """
+    P3：解析进度上下文。
+    - 进度值按真实页数推进（抽取 5%–65%，OCR 70%–90%），不是假进度条；
+    - 同时给出耗时预期；退出时（成功/失败/跳过）自动清掉进度与提示。
+    """
+    bar = st.progress(0.0, text=f"准备解析《{filename}》…")
+    hint = st.caption(
+        "解析通常需要 10 秒左右，大文件或扫描页更多时会更久；"
+        "下方进度按实际页数推进。"
+    )
+
+    def on_progress(stage, done, total):
+        bar.progress(
+            parse_progress_fraction(stage, done, total),
+            text=parse_progress_label(stage, done, total, _file_unit(filename)),
+        )
+
+    try:
+        yield bar, on_progress
+    finally:
+        bar.empty()
+        hint.empty()
+
+
 # ---------- 页面一：💬 问答 ----------
 def page_chat():
     """问答页：聊天窗口、流式回答、引用来源、摘要推荐问题、会话管理。"""
@@ -556,6 +628,8 @@ def page_chat():
     for name, brief in st.session_state.doc_briefs.items():
         with st.expander(f"📝 《{name}》全文摘要与推荐问题", expanded=False):
             st.markdown(brief.get("summary", ""))
+            if brief.get("usage"):
+                st.caption("📊 摘要生成 · " + format_usage(brief["usage"]))
             questions = brief.get("questions") or []
             if questions:
                 st.markdown("**推荐问题（点击直接提问）**")
@@ -564,11 +638,18 @@ def page_chat():
                         st.session_state.pending_question = q
 
     st.subheader(f"💬 当前会话：{st.session_state.session_title}")
+    # P3：让用户随时看到当前请求的模型名；每轮回答后另附 API 实际返回的用量与估算费用。
+    st.caption(
+        f"回答模型：{MODEL}（请求名，实际服务模型见每轮用量行）"
+        " · token 用量来自 API 返回的 usage，费用为官方价目估算"
+    )
 
     # 渲染历史消息（含引用来源）
     for msg in st.session_state.messages:
         with st.chat_message(msg["role"]):
             st.markdown(msg["content"])
+            if msg.get("usage"):
+                st.caption("📊 " + format_usage(msg["usage"]))
             if msg.get("sources"):
                 render_sources(msg["sources"])
 
@@ -646,32 +727,66 @@ def handle_question(question: str) -> bool:
 
     # v3.3：检索默认限定在本会话选定的文档内；没选则覆盖全部文档
     scope = st.session_state.get("session_scope_names") or []
-    contexts, answer = [], None
+    contexts, answer, usage = [], None, {}
+    error_text = ""
     with st.chat_message("assistant"):
+        # P3：提交后立刻显示「思考中」；首字出现或出错时清掉，避免一直转圈。
+        thinking = st.empty()
+        thinking.markdown(
+            "⏳ **思考中…** 正在检索相关资料并等待模型响应（首字通常 3–5 秒）"
+        )
         try:
             contexts = similarity_search(
                 USER_ID, question, top_k=4, sources=scope or None
             )
-            # write_stream 会逐段消费生成器，实现打字机效果
+            thinking.markdown("⏳ **思考中…** 已找到相关资料，正在生成回答…")
+            # write_stream 会逐段消费生成器，实现打字机效果；
+            # reveal_on_first_chunk 保证首个 chunk 到达即清掉占位、异常时也不残留。
             answer = st.write_stream(
-                stream_answer(question, contexts, history=history, api_key=api_key)
+                reveal_on_first_chunk(
+                    stream_answer(
+                        question,
+                        contexts,
+                        history=history,
+                        api_key=api_key,
+                        usage_out=usage,
+                    ),
+                    on_first=thinking.empty,
+                    on_finish=thinking.empty,
+                )
             )
         except QAFriendlyError as e:
-            st.warning(str(e))
-        except Exception as e:
-            st.error(f"出现未预期的错误：{e}")
+            thinking.empty()
+            error_text = str(e)
+            st.warning(error_text)
+        except Exception:
+            thinking.empty()
+            logger.exception("生成回答失败")
+            error_text = "生成回答时出现未预期的错误，请稍后重试。"
+            st.error(error_text)
+        finally:
+            thinking.empty()
 
         if answer is not None:
+            # P3：展示本轮 API 实际返回的 token 用量与估算费用（无用量则不显示）。
+            if usage.get("total_tokens"):
+                st.caption("📊 " + format_usage(usage))
             render_sources(contexts)
-            st.session_state.messages.append(
-                {"role": "assistant", "content": answer, "sources": contexts}
-            )
+            message = {"role": "assistant", "content": answer, "sources": contexts}
+            if usage.get("total_tokens"):
+                message["usage"] = usage
+            st.session_state.messages.append(message)
         else:
             st.session_state.messages.append(
-                {"role": "assistant", "content": "⚠️ 本次未生成回答，请检查 API Key 或网络后重试。"}
+                {
+                    "role": "assistant",
+                    "content": "⚠️ "
+                    + (error_text or "本次未生成回答，请检查 API Key 或网络后重试。"),
+                }
             )
     save_current_session()
-    return True
+    # 失败时不触发 rerun：否则刚显示的中文错误会被刷新掉，用户看不到原因。
+    return answer is not None
 
 
 # ---------- 页面二：📁 我的文档 ----------
@@ -722,7 +837,7 @@ def page_documents():
             if os.path.splitext(f.name)[1].lower() not in (".pdf", ".pptx"):
                 st.warning(f"《{f.name}》格式不支持，仅支持 PDF 与 PPTX，已跳过。")
                 continue
-            with st.spinner(f"正在处理《{f.name}》…"):
+            with _parse_progress(f.name) as (progress_bar, on_progress):
                 if document_exists(USER_ID, f.name):
                     st.info(f"《{f.name}》已入库，跳过。如需重新处理，请先删除它。")
                     continue
@@ -730,7 +845,11 @@ def page_documents():
                     # 按后缀分发解析；OCR 情况写进 report，供下方提示使用
                     ocr_report = {}
                     chunks = load_and_split_file(
-                        f, f.name, ocr_report=ocr_report, force_ocr=force_ocr
+                        f,
+                        f.name,
+                        ocr_report=ocr_report,
+                        force_ocr=force_ocr,
+                        on_progress=on_progress,
                     )
                 except FileParseError as e:
                     st.error(f"《{f.name}》解析失败：{e}")
@@ -764,6 +883,8 @@ def page_documents():
                     logger.warning("《%s》OCR 不可用：%s", f.name, ocr_report["ocr_error"])
                     st.warning("OCR 未启用（图片识别组件不可用），图片页内容可能被跳过。")
 
+                # 解析完成：进入向量化与写库阶段（真实耗时点，进度先给到 95%）
+                progress_bar.progress(0.95, text="正在切分并写入数据库…")
                 try:
                     n = add_document(
                         USER_ID,
@@ -793,6 +914,7 @@ def page_documents():
                 if not api_key:
                     st.info(f"《{f.name}》已入库；填写 API Key 后可自动生成摘要与推荐问题。")
                     continue
+                progress_bar.progress(0.99, text="正在生成摘要与推荐问题…")
                 try:
                     ctx = similarity_search(
                         USER_ID,
@@ -800,7 +922,13 @@ def page_documents():
                         top_k=6,
                         source=f.name,
                     )
-                    brief = generate_doc_brief(f.name, ctx, api_key=api_key)
+                    usage = {}
+                    brief = generate_doc_brief(
+                        f.name, ctx, api_key=api_key, usage_out=usage
+                    )
+                    if usage.get("total_tokens"):
+                        brief["usage"] = usage  # 随摘要一起持久化，之后仍可看到
+                        st.caption("📊 摘要生成 · " + format_usage(usage))
                     st.session_state.doc_briefs[f.name] = brief
                     save_document_summary(USER_ID, f.name, brief)  # 持久化
                 except QAFriendlyError as e:

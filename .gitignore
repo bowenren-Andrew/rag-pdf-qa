@@ -20,6 +20,7 @@ __pycache__/
 
 # 测试缓存
 .pytest_cache/
+.pytest-tmp/
 
 # 虚拟环境
 venv_pdf_qa/

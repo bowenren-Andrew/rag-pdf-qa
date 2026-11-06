@@ -13,7 +13,11 @@ qa.py（v3.1）
   2) stream_answer       —— 流式回答（逐段 yield，供 st.write_stream 使用）
   3) generate_doc_brief  —— 文档摘要 + 3 个推荐问题（不传历史）
 - 所有失败都抛出 QAFriendlyError（中文友好提示），由界面层展示，程序不崩溃。
+- v3.4 变更（P3）：三个调用函数新增可选参数 usage_out，把 API 返回的 token 用量
+  （含缓存命中/未命中）回传给界面；新增 estimate_cost / format_usage，
+  按 DeepSeek 官方价目估算本轮费用；流式请求显式开启 include_usage。
 """
+import datetime as dt
 import json
 import logging
 import os
@@ -31,9 +35,132 @@ from openai import (
 
 # DeepSeek 官方接口（OpenAI 兼容）
 BASE_URL = "https://api.deepseek.com"
+# 请求使用的模型名。deepseek-chat 是历史别名，实际服务的模型以响应中的 model 字段为准，
+# 界面展示的也是响应返回值（不把猜测写死）。
 MODEL = "deepseek-chat"
 
+# ---------------- P3：用量与费用估算 ----------------
+# 官方价目（人民币 / 百万 tokens），来源：DeepSeek 开放平台「模型 & 价格」页（2026-11 查询）。
+# 高峰时段 = 北京时间周一至周五 9:00–12:00、14:00–18:00；其余时段为空闲价。
+# 法定节假日未单独扣除，节假日会按高峰价估算（偏保守）；价格调整时只需改这里。
+PRICE_TABLE = {
+    "flash": {
+        "peak": {"cache_hit": 0.04, "cache_miss": 2.0, "output": 8.0},
+        "offpeak": {"cache_hit": 0.02, "cache_miss": 1.0, "output": 4.0},
+    },
+    "pro": {
+        "peak": {"cache_hit": 0.30, "cache_miss": 9.0, "output": 27.0},
+        "offpeak": {"cache_hit": 0.15, "cache_miss": 4.5, "output": 13.5},
+    },
+}
+BEIJING_TZ = dt.timezone(dt.timedelta(hours=8))
+
 logger = logging.getLogger(__name__)
+
+
+def _model_tier(model_name: str) -> str:
+    """按响应里的模型名选择价目档位：带 pro 的走 Pro 价，其余按 Flash 价估算。"""
+    return "pro" if "pro" in str(model_name or "").lower() else "flash"
+
+
+def is_peak_time(now: dt.datetime = None) -> bool:
+    """判断北京时间是否处于 DeepSeek 高峰时段（法定节假日未单独扣除）。"""
+    current = now or dt.datetime.now(BEIJING_TZ)
+    if current.tzinfo is None:
+        current = current.replace(tzinfo=BEIJING_TZ)
+    else:
+        current = current.astimezone(BEIJING_TZ)
+    if current.weekday() >= 5:
+        return False
+    return 9 <= current.hour < 12 or 14 <= current.hour < 18
+
+
+def _usage_field(usage, name):
+    """读取 usage 字段，同时兼容 SDK 对象、dict 与 model_extra 里的扩展字段。"""
+    if usage is None:
+        return None
+    if isinstance(usage, dict):
+        return usage.get(name)
+    value = getattr(usage, name, None)
+    if value is None:
+        extra = getattr(usage, "model_extra", None) or {}
+        if isinstance(extra, dict):
+            value = extra.get(name)
+    return value
+
+
+def usage_to_dict(usage, model: str = None) -> dict:
+    """把 API 返回的 usage 统一成可持久化、可展示的 dict。"""
+    prompt = int(_usage_field(usage, "prompt_tokens") or 0)
+    completion = int(_usage_field(usage, "completion_tokens") or 0)
+    total = int(_usage_field(usage, "total_tokens") or (prompt + completion))
+    hit = _usage_field(usage, "prompt_cache_hit_tokens")
+    if hit is None:
+        hit = _usage_field(_usage_field(usage, "prompt_tokens_details"), "cached_tokens")
+    miss = _usage_field(usage, "prompt_cache_miss_tokens")
+    hit = None if hit is None else int(hit)
+    miss = None if miss is None else int(miss)
+    if hit is None and miss is not None:
+        hit = max(prompt - miss, 0)
+    elif miss is None and hit is not None:
+        miss = max(prompt - hit, 0)
+    return {
+        "model": model or MODEL,
+        "prompt_tokens": prompt,
+        "completion_tokens": completion,
+        "total_tokens": total,
+        "prompt_cache_hit_tokens": hit,
+        "prompt_cache_miss_tokens": miss,
+    }
+
+
+def _capture_usage(usage_out: dict, usage, model=None) -> None:
+    """把一次调用的 usage 写进调用方传入的 dict；传 None 或解析失败时静默跳过。"""
+    if usage_out is None or usage is None:
+        return
+    try:
+        name = model if isinstance(model, str) and model else None
+        usage_out.update(usage_to_dict(usage, name))
+    except (TypeError, ValueError):
+        logger.debug("无法解析 API usage：%r", usage)
+
+
+def estimate_cost(usage: dict, now: dt.datetime = None) -> float:
+    """按官方价目估算一次调用的费用（单位：元）。"""
+    usage = usage or {}
+    period = "peak" if is_peak_time(now) else "offpeak"
+    prices = PRICE_TABLE[_model_tier(usage.get("model"))][period]
+    prompt = int(usage.get("prompt_tokens") or 0)
+    hit = usage.get("prompt_cache_hit_tokens")
+    hit = 0 if hit is None else int(hit)
+    miss = usage.get("prompt_cache_miss_tokens")
+    miss = max(prompt - hit, 0) if miss is None else int(miss)
+    completion = int(usage.get("completion_tokens") or 0)
+    return (
+        hit * prices["cache_hit"]
+        + miss * prices["cache_miss"]
+        + completion * prices["output"]
+    ) / 1_000_000
+
+
+def format_usage(usage: dict, now: dt.datetime = None) -> str:
+    """生成给界面展示的一行用量说明；没有用量数据时返回空字符串。"""
+    if not usage or not usage.get("total_tokens"):
+        return ""
+    cost = estimate_cost(usage, now=now)
+    period = "高峰价" if is_peak_time(now) else "空闲价"
+    prompt = int(usage.get("prompt_tokens") or 0)
+    hit = usage.get("prompt_cache_hit_tokens")
+    miss = usage.get("prompt_cache_miss_tokens")
+    miss = max(prompt - int(hit or 0), 0) if miss is None else int(miss)
+    hit_part = f"（缓存命中 {int(hit):,}）" if hit is not None else ""
+    completion = int(usage.get("completion_tokens") or 0)
+    return (
+        f"模型 {usage.get('model') or MODEL} · 输入 {prompt:,} tokens{hit_part}"
+        f" · 缓存未命中 {miss:,} · 输出 {completion:,} tokens"
+        f" · 估算费用 ¥{cost:.4f}（按官方{period}，仅供参考）"
+    )
+
 
 # 项目根目录 = 本文件所在目录，.env 与 app.py 同级
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
@@ -196,10 +323,12 @@ def generate_answer(
     contexts: list[dict],
     history: list[dict] = None,
     api_key: str = None,
+    usage_out: dict = None,
 ) -> str:
     """
     非流式生成回答（一次性返回完整文本，备用）。
     :param history: 可选，多轮对话历史 [{"role","content"}, ...]，内部会先做截断保护
+    :param usage_out: 可选，传入空 dict 时把 API 返回的用量写进去（供界面展示）
     """
     client = _require_client(api_key)
     if not contexts:
@@ -216,6 +345,9 @@ def generate_answer(
             ],
             temperature=0.3,
         )
+        _capture_usage(
+            usage_out, getattr(resp, "usage", None), getattr(resp, "model", None)
+        )
         return resp.choices[0].message.content.strip()
     except Exception as e:
         raise _friendly(e)
@@ -226,10 +358,12 @@ def stream_answer(
     contexts: list[dict],
     history: list[dict] = None,
     api_key: str = None,
+    usage_out: dict = None,
 ) -> Iterator[str]:
     """
     流式生成回答：逐段 yield 文本，配合 st.write_stream 实现打字机效果。
     :param history: 可选，多轮对话历史 [{"role","content"}, ...]，内部会先做截断保护
+    :param usage_out: 可选，传入空 dict 时把 API 返回的用量写进去（供界面展示）
     """
     client = _require_client(api_key)
     if not contexts:
@@ -246,8 +380,12 @@ def stream_answer(
             ],
             temperature=0.3,
             stream=True,
+            stream_options={"include_usage": True},
         )
         for chunk in stream:
+            _capture_usage(
+                usage_out, getattr(chunk, "usage", None), getattr(chunk, "model", None)
+            )
             # 流式结束时的 usage 块 choices 可能为空列表，需先保护
             if not chunk.choices:
                 continue
@@ -259,11 +397,15 @@ def stream_answer(
 
 
 def generate_doc_brief(
-    filename: str, contexts: list[dict], api_key: str = None
+    filename: str,
+    contexts: list[dict],
+    api_key: str = None,
+    usage_out: dict = None,
 ) -> dict:
     """
     文档上传后自动生成：全文摘要 + 3 个推荐问题。
     :return: {"summary": 摘要文本, "questions": [问题1, 问题2, 问题3]}
+    :param usage_out: 可选，传入空 dict 时把 API 返回的用量写进去（供界面展示）
     """
     client = _require_client(api_key)
     refs = "\n\n".join(
@@ -284,6 +426,9 @@ def generate_doc_brief(
                 {"role": "user", "content": prompt},
             ],
             temperature=0.3,
+        )
+        _capture_usage(
+            usage_out, getattr(resp, "usage", None), getattr(resp, "model", None)
         )
         raw = resp.choices[0].message.content.strip()
     except Exception as e:

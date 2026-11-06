@@ -54,6 +54,16 @@ def _pdf_error_message(error: Exception) -> str:
     return MSG_BROKEN_PDF
 
 
+def _notify_progress(on_progress, stage: str, done: int, total: int) -> None:
+    """把解析阶段进度回调给界面；回调本身出错不能影响解析。"""
+    if on_progress is None:
+        return
+    try:
+        on_progress(stage, done, total)
+    except Exception:
+        logger.debug("进度回调异常", exc_info=True)
+
+
 def _repair_broken_words(text: str) -> str:
     """
     修复 PDF 排版造成的单词/编号断字（BUG-10）。
@@ -214,7 +224,10 @@ def _render_pdf_page_png(data: bytes, page_no: int, zoom: float = OCR_ZOOM) -> b
 
 
 def load_and_split_pdf(
-    file: Union[str, IO[bytes]], ocr_report: dict = None, force_ocr: bool = False
+    file: Union[str, IO[bytes]],
+    ocr_report: dict = None,
+    force_ocr: bool = False,
+    on_progress=None,
 ) -> list[dict]:
     """
     读取 PDF 并切分文本；无文本页（扫描件、图片页）自动走 OCR 兜底。
@@ -222,6 +235,8 @@ def load_and_split_pdf(
     :param ocr_report: 可选，传入一个空 dict，函数会把 OCR 情况写进去：
                        {"ocr_pages": [走过OCR的页码], "ocr_failed": [OCR仍失败的页码],
                         "ocr_error": "引擎不可用的原因", "ocr_mode": "auto"/"force"}
+    :param on_progress: 可选回调 (stage, done, total)，stage 为 "extract"/"ocr"，
+                        用于界面展示真实解析进度；回调异常会被忽略。
     :param force_ocr: True 时忽略文本层、对每一页都渲染成图片走 OCR。
                       适用于 LaTeX 导出的公式类 PDF——这类文件有文本层（整页字数不少），
                       但公式符号没有文本映射、提取后公式位置为空白，常规兜底不会触发。
@@ -249,6 +264,7 @@ def load_and_split_pdf(
         for chunk in _split_page_text(text):
             results.append({"text": chunk, "page": page_no})
 
+    total_pages = len(reader.pages)
     for page_no, page in enumerate(reader.pages, start=1):
         try:
             raw_text = page.extract_text() or ""
@@ -265,6 +281,7 @@ def load_and_split_pdf(
             pending_ocr.append((page_no, cleaned))
         else:
             _append(page_no, cleaned)
+        _notify_progress(on_progress, "extract", page_no, total_pages)
 
     ocr_pages, ocr_failed = [], []
     if pending_ocr:
@@ -278,7 +295,8 @@ def load_and_split_pdf(
             data = None
 
         if data:
-            for page_no, fallback in pending_ocr:
+            total_ocr = len(pending_ocr)
+            for ocr_index, (page_no, fallback) in enumerate(pending_ocr, start=1):
                 try:
                     png = _render_pdf_page_png(data, page_no)
                     text = _clean_text(_ocr_image(png))
@@ -296,6 +314,7 @@ def load_and_split_pdf(
                 else:
                     # 真的一个字都没有，才算这一页被跳过
                     ocr_failed.append(page_no)
+                _notify_progress(on_progress, "ocr", ocr_index, total_ocr)
         else:
             # 读不到原始数据：退回原本提取到的短文本，只有完全无文本的页才算跳过
             for page_no, fallback in pending_ocr:
@@ -350,7 +369,7 @@ def _iter_shape_text(shape) -> list[str]:
     return texts
 
 
-def load_and_split_pptx(file: Union[str, IO[bytes]]) -> list[dict]:
+def load_and_split_pptx(file: Union[str, IO[bytes]], on_progress=None) -> list[dict]:
     """
     读取 PPTX 并切分文本：逐张幻灯片提取所有形状的文本（含表格单元格），
     同一张幻灯片内的文本用换行连接，然后复用清洗与切分逻辑。
@@ -369,15 +388,16 @@ def load_and_split_pptx(file: Union[str, IO[bytes]]) -> list[dict]:
         logger.warning("PPTX 读取失败：%s", e)
         raise FileParseError(MSG_BROKEN_PPTX) from e
     results = []
+    total_slides = len(prs.slides)
     for slide_no, slide in enumerate(prs.slides, start=1):
         parts = []
         for shape in slide.shapes:
             parts.extend(_iter_shape_text(shape))
         cleaned = _clean_text("\n".join(parts))
-        if not cleaned:
-            continue  # 跳过空白幻灯片
-        for chunk in _split_page_text(cleaned):
-            results.append({"text": chunk, "page": slide_no})
+        if cleaned:
+            for chunk in _split_page_text(cleaned):
+                results.append({"text": chunk, "page": slide_no})
+        _notify_progress(on_progress, "extract", slide_no, total_slides)
     return results
 
 
@@ -386,6 +406,7 @@ def load_and_split_file(
     filename: str,
     ocr_report: dict = None,
     force_ocr: bool = False,
+    on_progress=None,
 ) -> list[dict]:
     """
     按文件后缀分发解析器（PDF 走 PDF 解析，PPTX 走 PPTX 解析）。
@@ -401,8 +422,13 @@ def load_and_split_file(
         )
     try:
         if ext == "pdf":
-            return load_and_split_pdf(file, ocr_report=ocr_report, force_ocr=force_ocr)
-        return load_and_split_pptx(file)
+            return load_and_split_pdf(
+                file,
+                ocr_report=ocr_report,
+                force_ocr=force_ocr,
+                on_progress=on_progress,
+            )
+        return load_and_split_pptx(file, on_progress=on_progress)
     except FileParseError:
         raise
     except Exception as e:
