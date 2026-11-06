@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """P3：提交后页面顶部「思考中」提示（点击回调 + 首个 delta 渲染）的测试。"""
 import os
+from unittest.mock import patch
 
 from streamlit.testing.v1 import AppTest
 
@@ -55,12 +56,22 @@ def _open_chat(tmp_db, username: str):
     return at
 
 
+def _ok_stream(*args, **kwargs):
+    yield "这是回答"
+
+
 def test_顶部思考中提示不会残留(tmp_db, fernet_key):
-    """待提问状态被消费后，顶部占位必须清掉，不能一直挂在页面上。"""
+    """真实点击发送后，顶部占位必须清掉，不能和聊天区占位重复或残留。"""
     at = _open_chat(tmp_db, "p3_banner")
-    at.session_state["ask_pending"] = "电池更换多少钱？"
-    at.run()
+    at.text_area[0].set_value("电池更换多少钱？").run()
+
+    with patch("qa.stream_answer", side_effect=_ok_stream), patch(
+        "vectorstore.similarity_search", return_value=[]
+    ):
+        next(b for b in at.button if b.label == "发送").click().run()
 
     body = " ".join(m.value for m in at.markdown)
     assert "正在准备回答" not in body
+    assert "思考中" not in body
+    assert "这是回答" in body
     assert "ask_pending" not in at.session_state

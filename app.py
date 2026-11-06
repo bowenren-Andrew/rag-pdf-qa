@@ -658,10 +658,6 @@ def page_chat():
                     if st.button(q, key=f"sug_{name}_{i}"):
                         st.session_state.pending_question = q
 
-    # 聊天区马上渲染（内部还有「思考中」占位），顶部临时提示到此交接，避免重复。
-    if _ask_banner is not None:
-        _ask_banner.empty()
-
     st.subheader(f"💬 当前会话：{st.session_state.session_title}")
     # P3：让用户随时看到当前请求的模型名；每轮回答后另附 API 实际返回的用量与估算费用。
     st.caption(
@@ -710,6 +706,10 @@ def page_chat():
         elif len(typed) > MAX_QUESTION_CHARS:
             st.warning(f"问题不能超过 {MAX_QUESTION_CHARS} 字，请缩短后重试。")
         else:
+            # 聊天区立刻会渲染「思考中」占位，顶部临时提示到此交接，避免重复
+            # 也避免中间出现没有任何反馈的空窗。
+            if _ask_banner is not None:
+                _ask_banner.empty()
             if handle_question(typed):
                 st.session_state._clear_question_input = True
                 st.rerun()
@@ -719,6 +719,10 @@ def page_chat():
         q = st.session_state.pending_question
         st.session_state.pending_question = None
         handle_question(q)
+
+    # 兜底：任何路径都没走到交接点时，本轮结束前也要清掉顶部提示，避免残留。
+    if _ask_banner is not None:
+        _ask_banner.empty()
 
 
 def _build_history() -> list[dict]:
