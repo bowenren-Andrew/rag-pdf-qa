@@ -46,21 +46,24 @@ st.set_page_config(
 # P3：首屏加载骨架。Streamlit Cloud 的「休眠唤醒」页由平台接管、应用层改不了；
 # 这里保证脚本一开始执行就先给出可见提示，覆盖后面 torch / sentence-transformers
 # 等重依赖的 import 时间（这些 import 原本发生在任何 st 输出之前，用户看到的是空白）。
-_boot_placeholder = st.empty()
-_boot_placeholder.markdown(
-    """
-    <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;
-                min-height:52vh;gap:12px;color:#6B7280;">
-      <div style="font-size:40px">📄</div>
-      <div style="font-size:18px;font-weight:600;color:#374151">正在加载 PDF 智能问答…</div>
-      <div style="font-size:13px">首次唤醒通常需要 10–20 秒，请稍候；之后会明显更快。</div>
-      <div style="width:220px;height:4px;border-radius:2px;background:#E5E7EB;overflow:hidden">
-        <div style="width:45%;height:100%;background:#2563EB;border-radius:2px"></div>
-      </div>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
+# 只在本次会话首次运行时显示：随后的每次 rerun 不再闪一下全屏加载提示。
+_boot_placeholder = None
+if "app_booted" not in st.session_state:
+    _boot_placeholder = st.empty()
+    _boot_placeholder.markdown(
+        """
+        <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;
+                    min-height:52vh;gap:12px;color:#6B7280;">
+          <div style="font-size:40px">📄</div>
+          <div style="font-size:18px;font-weight:600;color:#374151">正在加载 PDF 智能问答…</div>
+          <div style="font-size:13px">首次唤醒通常需要 10–20 秒，请稍候；之后会明显更快。</div>
+          <div style="width:220px;height:4px;border-radius:2px;background:#E5E7EB;overflow:hidden">
+            <div style="width:45%;height:100%;background:#2563EB;border-radius:2px"></div>
+          </div>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
 
 
 # ---------- 云端适配：把 Streamlit Secrets 同步进环境变量 ----------
@@ -114,11 +117,14 @@ logger = logging.getLogger(__name__)
 try:
     db.init_db()
 except Exception as e:
-    _boot_placeholder.empty()
+    if _boot_placeholder is not None:
+        _boot_placeholder.empty()
     st.error(f"数据库连接失败：{e}")
     st.stop()
 
-_boot_placeholder.empty()
+if _boot_placeholder is not None:
+    _boot_placeholder.empty()
+    st.session_state["app_booted"] = True
 
 
 # ---------- 极少量自定义 CSS：只做圆角、分隔线与卡片阴影，不加动画 ----------

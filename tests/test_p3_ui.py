@@ -121,7 +121,8 @@ def test_摘要用量在问答页可见(tmp_db, fernet_key):
 
 
 def test_首屏加载骨架不会残留(tmp_db, fernet_key):
-    """骨架屏只在加载阶段显示，脚本跑完后必须清掉。"""
+    """骨架屏只在首次加载阶段显示，脚本跑完后必须清掉且不再重复出现。"""
     at = _open_chat(tmp_db, "p3_boot")
 
     assert "正在加载 PDF 智能问答" not in _body(at)
+    assert at.session_state["app_booted"] is True
