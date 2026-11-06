@@ -206,6 +206,9 @@ def test_OCR引擎关闭角度分类器(monkeypatch):
     class FakeOCR:
         def __init__(self, **kwargs):
             options.update(kwargs)
+            # 模拟新版引擎：旧参数可能被忽略，且两个开关名都存在
+            self.use_angle_cls = True
+            self.use_cls = True
 
     monkeypatch.setattr(rapidocr_onnxruntime, "RapidOCR", FakeOCR)
     monkeypatch.setattr(loader, "_ocr_engine", None)
@@ -214,3 +217,5 @@ def test_OCR引擎关闭角度分类器(monkeypatch):
     loader._get_ocr()
 
     assert options.get("use_angle_cls") is False
+    assert loader._ocr_engine.use_angle_cls is False
+    assert loader._ocr_engine.use_cls is False

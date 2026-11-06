@@ -242,7 +242,14 @@ def _get_ocr():
     try:
         from rapidocr_onnxruntime import RapidOCR
 
-        _ocr_engine = RapidOCR(use_angle_cls=False)
+        engine = RapidOCR(use_angle_cls=False)
+        # 不同 RapidOCR 版本对角度分类开关的命名/处理不一致：有的用
+        # use_angle_cls，有的用 use_cls，旧参数还可能被静默忽略。
+        # 构造完成后再显式关闭一次，确保线上新版本也不会走角度分类器。
+        for flag in ("use_angle_cls", "use_cls"):
+            if hasattr(engine, flag):
+                setattr(engine, flag, False)
+        _ocr_engine = engine
     except Exception as e:  # 模型未下载、依赖缺失等情况都走这里
         _ocr_error = f"OCR 引擎初始化失败：{e}"
         raise RuntimeError(_ocr_error) from e
