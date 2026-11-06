@@ -177,6 +177,8 @@ def test_保存Key成功后输入框清空(tmp_db, fernet_key, monkeypatch):
     next(b for b in at.button if b.label == "保存 Key").click().run()
 
     assert _key_input(at).value in ("", None)
+    assert at.session_state["_api_key_input_version"] == 1
+    assert "new_api_key_input_0" not in at.session_state
     assert db.get_user_by_id(user["id"])["api_key_enc"]
 
 
@@ -189,6 +191,8 @@ def test_删除Key后输入框清空(tmp_db, fernet_key):
     next(b for b in at.button if b.label == "删除已保存的 Key").click().run()
 
     assert _key_input(at).value in ("", None)
+    assert at.session_state["_api_key_input_version"] == 1
+    assert "new_api_key_input_0" not in at.session_state
     assert db.get_user_by_id(user["id"])["api_key_enc"] is None
 
 

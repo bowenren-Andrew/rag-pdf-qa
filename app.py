@@ -1048,10 +1048,21 @@ def page_settings():
     )
 
     # P3-2：保存成功或删除后清空 Key 输入框，避免明文留在前端 widget 状态里。
-    # 单独用标记位在 rerun 前排队，下一次渲染创建 widget 之前再清，避免
-    # Streamlit 禁止在 widget 实例化后修改其状态的限制。
+    # 只 pop 旧 key 在真实浏览器里不会让已挂载的 input 清空（AppTest 看不出差异），
+    # 所以这里递增版本号换一个新的 widget key，强制前端重新挂载空输入框。
     if st.session_state.pop("_reset_api_key_input", False):
-        st.session_state.pop("new_api_key_input", None)
+        st.session_state["_api_key_input_version"] = (
+            st.session_state.get("_api_key_input_version", 0) + 1
+        )
+        for stale_key in [
+            k for k in list(st.session_state.keys())
+            if k.startswith("new_api_key_input")
+        ]:
+            st.session_state.pop(stale_key, None)
+
+    api_key_widget_key = (
+        f"new_api_key_input_{st.session_state.get('_api_key_input_version', 0)}"
+    )
 
     with st.form("api_key_form"):
         new_key = st.text_input(
@@ -1059,7 +1070,7 @@ def page_settings():
             type="password",
             placeholder="sk-...",
             help="保存后会覆盖旧 Key",
-            key="new_api_key_input",
+            key=api_key_widget_key,
         )
         saved = st.form_submit_button("保存 Key", type="primary")
     if saved:
