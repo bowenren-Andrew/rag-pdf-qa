@@ -72,6 +72,8 @@ def _repair_broken_words(text: str) -> str:
     - 邮箱局部被拆成 "suppor t@..."：合并成 "support@..."；
     - 邮箱 @ 两侧的空白；
     - 型号/编号被拆成 "X 1"、"SN 12345"：合并为连续字符串。
+    - 数字+大写字母被拆成 "5A TM"：合并为 "5ATM"（DEF-01）；
+    - 短大写字母对被拆开且紧邻中文："AM OLED屏"：合并为 "AMOLED屏"。
     """
     if not text:
         return ""
@@ -82,7 +84,51 @@ def _repair_broken_words(text: str) -> str:
     text = re.sub(r"(?<=@)\s+", "", text)
     # 型号/编号：短大写前缀与数字之间被拆开（X 1、SN 12345、USB 3）
     text = re.sub(r"\b([A-Z]{1,4})\s+(\d{1,6})\b", r"\1\2", text)
+    # DEF-01：数字+大写字母+大写字母被拆开（5A TM → 5ATM）。
+    # 只在其后紧跟中文/标点/行尾时合并，避免误伤 "5A TM1000" 这类正常间隔。
+    text = re.sub(
+        r"(?<=\d)([A-Z]{1,3})\s+([A-Z]{1,4})(?=\s?[\u4e00-\u9fff]|\s?[，。；：、（）)]|$)",
+        r"\1\2",
+        text,
+    )
+    # DEF-01：1–2 个字母与 2–4 个字母组成的短大写串被拆开（AM OLED屏 → AMOLED屏）。
+    # 要求首个片段不超过 2 个字母，避免把 "PDF FILE"、"HTTP API" 这类正常词组粘起来。
+    text = re.sub(
+        r"\b([A-Z]{1,2})\s+([A-Z]{2,4})(?=\s?[\u4e00-\u9fff]|\s?[，。；：、（）)]|$)",
+        r"\1\2",
+        text,
+    )
     return text
+
+
+def _fix_ocr_chars(text: str) -> str:
+    """
+    修正 OCR 常见的字符混淆（DEF-05），只用于 OCR 识别出的文本。
+
+    - 型号里的乘号：云雀×1 → 云雀X1（466×466、7×24 这类数字间的乘号保持不变）；
+    - 负温度：-10C → -10℃；
+    - 温度区间起点：45C至50C → 45℃至50℃。
+    规则都要求上下文（前一个中文/负号数字、后面是数字或“至/到”），避免误伤型号。
+    """
+    if not text:
+        return ""
+    # 中文后面紧跟“乘号+数字”：OCR 把型号里的 X 认成了 ×
+    text = re.sub(r"(?<=[\u4e00-\u9fff])\s*[×✕]\s*(?=\d)", "X", text)
+    # 负温度：-10C → -10℃（后面不能再跟字母，避免 -10Cx 这类编号被改）
+    text = re.sub(r"([-−]\d{1,3})\s*[Cc](?![A-Za-z])", r"\1℃", text)
+    # 温度区间起点：-10C至45C → -10℃至45℃
+    text = re.sub(r"(\d)\s*[Cc](?=\s*(?:至|到|~|～))", r"\1℃", text)
+    # 温度区间终点：-10℃至45C → -10℃至45℃（只在已有 ℃ 的区间里改，避免误伤 5C 快充）
+    text = re.sub(r"(℃\s*(?:至|到|~|～)\s*\d{1,3})\s*[Cc](?![A-Za-z])", r"\1℃", text)
+    return text
+
+
+def repair_chunk_text(text: str) -> str:
+    """
+    对已入库片段做一次文本后处理（DEF-02）：只修断字与 OCR 字符混淆，
+    不重新抽取、不重新 OCR、不改动其他内容。
+    """
+    return _fix_ocr_chars(_repair_broken_words(text or ""))
 
 
 # OCR 引擎懒加载缓存：只有真的遇到无文本页时才会初始化（首次会下载识别模型）
@@ -182,6 +228,11 @@ def _get_ocr():
     懒加载 RapidOCR 引擎（只有真的遇到无文本页时才会调用）。
     首次调用会自动下载识别模型（约几十 MB），失败时抛 RuntimeError 并缓存原因，
     避免对每一页重复尝试、拖慢入库。
+
+    DEF-05：关闭角度分类器（use_angle_cls=False）。
+    该分类器会把横排长行误判成 180° 倒置（实测置信度 0.98），翻转后整行识别为空串，
+    随后又被置信度过滤掉，表现为「整句凭空消失」。倒置扫描页极少见，
+    真遇到时旋转 PDF 再传即可，不值得为此承担静默丢行的风险。
     """
     global _ocr_engine, _ocr_error
     if _ocr_engine is not None:
@@ -191,7 +242,7 @@ def _get_ocr():
     try:
         from rapidocr_onnxruntime import RapidOCR
 
-        _ocr_engine = RapidOCR()
+        _ocr_engine = RapidOCR(use_angle_cls=False)
     except Exception as e:  # 模型未下载、依赖缺失等情况都走这里
         _ocr_error = f"OCR 引擎初始化失败：{e}"
         raise RuntimeError(_ocr_error) from e
@@ -299,7 +350,8 @@ def load_and_split_pdf(
             for ocr_index, (page_no, fallback) in enumerate(pending_ocr, start=1):
                 try:
                     png = _render_pdf_page_png(data, page_no)
-                    text = _clean_text(_ocr_image(png))
+                    # OCR 文本额外过一遍字符混淆修正（DEF-05）；文本层不走这一步
+                    text = _fix_ocr_chars(_clean_text(_ocr_image(png)))
                 except Exception as e:
                     # 单页 OCR 失败绝不能中断整个文件的入库
                     if ocr_report is not None:

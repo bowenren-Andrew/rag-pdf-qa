@@ -65,6 +65,22 @@ def test_clean_text_修复型号和编号断字():
     assert out == "型号 X1，序列号 SN12345。"
 
 
+def test_clean_text_修复数字与大写字母断字():
+    """DEF-01：5A TM 这类“数字+大写字母+大写字母”被拆开时应合并（5ATM）。"""
+    out = _clean_text("GPS 定位与 5A TM\n防水。")
+    assert out == "GPS 定位与 5ATM防水。"
+
+
+def test_clean_text_修复短大写字母对断字():
+    """DEF-01：AM OLED 这类短大写字母对被拆开且紧邻中文时应合并。"""
+    assert _clean_text("AM OLED屏幕") == "AMOLED屏幕"
+
+
+def test_clean_text_不误合并正常大写词组():
+    """DEF-01：PDF FILE / HTTP API 这类本来就该分开的大写词组必须保留空格。"""
+    assert _clean_text("PDF FILE 与 HTTP API") == "PDF FILE 与 HTTP API"
+
+
 def test_clean_text_不误合并正常英文词组():
     """只修复低风险断字模式，正常的英文单词间隔必须保留。"""
     assert _clean_text("Hello world and Product 2") == "Hello world and Product 2"

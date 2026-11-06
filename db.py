@@ -414,6 +414,45 @@ def _document_to_dict(d: Document, with_summary: bool = True) -> dict:
     return out
 
 
+def _document_columns():
+    """
+    文档列表/摘要查询用的列（OBS-02/03）：
+    只取界面需要的小字段，原始 file_data 用布尔表达式代替，
+    避免每次 rerun 都把单个最大 20MB 的原始文件从数据库整列拉回来。
+    """
+    return (
+        Document.id,
+        Document.user_id,
+        Document.filename,
+        Document.doc_type,
+        Document.chunk_count,
+        Document.file_size,
+        Document.summary_json,
+        Document.created_at,
+        Document.file_data.isnot(None).label("has_file"),
+    )
+
+
+def _document_row_to_dict(row, with_summary: bool = True) -> dict:
+    """把 _document_columns() 查询出的一行转成与 _document_to_dict 相同的结构。"""
+    out = {
+        "id": row.id,
+        "user_id": row.user_id,
+        "filename": row.filename,
+        "doc_type": row.doc_type,
+        "chunk_count": row.chunk_count,
+        "file_size": row.file_size,
+        "has_file": bool(row.has_file),
+        "created_at": row.created_at,
+    }
+    if with_summary:
+        try:
+            out["summary"] = json.loads(row.summary_json) if row.summary_json else None
+        except Exception:
+            out["summary"] = None
+    return out
+
+
 def create_document(
     user_id: int,
     filename: str,
@@ -439,35 +478,35 @@ def get_document(user_id: int, document_id: int) -> dict | None:
     """按 ID 取文档（校验归属）；不存在或不属于该用户返回 None。"""
     with session_scope() as db:
         d = (
-            db.query(Document)
+            db.query(*_document_columns())
             .filter(Document.id == document_id, Document.user_id == user_id)
             .one_or_none()
         )
-        return _document_to_dict(d) if d else None
+        return _document_row_to_dict(d) if d else None
 
 
 def get_document_by_name(user_id: int, filename: str) -> dict | None:
     """按文件名取当前用户的文档（同名文件以最新一条为准）。"""
     with session_scope() as db:
         d = (
-            db.query(Document)
+            db.query(*_document_columns())
             .filter(Document.user_id == user_id, Document.filename == filename)
             .order_by(Document.id.desc())
             .first()
         )
-        return _document_to_dict(d) if d else None
+        return _document_row_to_dict(d) if d else None
 
 
 def list_user_documents(user_id: int) -> list[dict]:
     """列出当前用户的全部文档（按上传时间倒序），不含 file_data。"""
     with session_scope() as db:
         rows = (
-            db.query(Document)
+            db.query(*_document_columns())
             .filter(Document.user_id == user_id)
             .order_by(Document.id.desc())
             .all()
         )
-        return [_document_to_dict(d) for d in rows]
+        return [_document_row_to_dict(r) for r in rows]
 
 
 def set_document_summary(user_id: int, document_id: int, brief: dict) -> bool:
@@ -600,6 +639,49 @@ def insert_chunks(user_id: int, document_id: int, rows: list[dict]) -> int:
             {"chunk_count": len(rows)}
         )
     return len(rows)
+
+
+def repair_chunk_texts(user_id: int, repair, batch_size: int = 200) -> dict:
+    """
+    对当前用户已入库的全部片段跑一次文本后处理（DEF-02）。
+
+    - 只读当前用户自己的片段（user_id 过滤），不触碰其他账号的数据；
+    - 只更新文本确实有变化的行，幂等，可以重复执行；
+    - 不重新抽取、不重新 OCR，也不改表结构；
+    - 按主键分批读取，避免一次把全部片段读进内存。
+    :param repair: 纯函数 str -> str（如 loader.repair_chunk_text）
+    :return: {"checked": 检查条数, "repaired": 修改条数}
+    """
+    stats = {"checked": 0, "repaired": 0}
+    if not user_id:
+        return stats
+    batch = max(int(batch_size or 200), 1)
+    last_id = 0
+    while True:
+        with session_scope() as db:
+            rows = (
+                db.query(DocumentChunk.id, DocumentChunk.text)
+                .filter(
+                    DocumentChunk.user_id == user_id,
+                    DocumentChunk.id > last_id,
+                )
+                .order_by(DocumentChunk.id)
+                .limit(batch)
+                .all()
+            )
+            if not rows:
+                break
+            for row in rows:
+                last_id = row.id
+                stats["checked"] += 1
+                new_text = repair(row.text or "")
+                if new_text and new_text != row.text:
+                    db.query(DocumentChunk).filter(
+                        DocumentChunk.id == row.id,
+                        DocumentChunk.user_id == user_id,
+                    ).update({"text": new_text})
+                    stats["repaired"] += 1
+    return stats
 
 
 def _vec_literal(vec: list | None) -> str:
@@ -783,21 +865,17 @@ def get_session_document_ids(user_id: int, session_id: int) -> list[int]:
 
 def list_session_documents(user_id: int, session_id: int) -> list[dict]:
     """某个会话绑定的文档列表（含摘要），加载旧会话时用它恢复文档与摘要。"""
-    ids = get_session_document_ids(user_id, session_id)
-    if not ids:
-        return []
     with session_scope() as db:
-        s = (
-            db.query(ChatSession)
-            .filter(ChatSession.id == session_id, ChatSession.user_id == user_id)
-            .one_or_none()
-        )
-        if s is None:
-            return []
         rows = (
-            db.query(Document)
-            .filter(Document.id.in_(ids))
+            db.query(*_document_columns())
+            .join(SessionDocument, SessionDocument.document_id == Document.id)
+            .join(ChatSession, ChatSession.id == SessionDocument.session_id)
+            .filter(
+                SessionDocument.session_id == session_id,
+                ChatSession.user_id == user_id,
+                Document.user_id == user_id,
+            )
             .order_by(Document.id)
             .all()
         )
-        return [_document_to_dict(d) for d in rows]
+        return [_document_row_to_dict(r) for r in rows]

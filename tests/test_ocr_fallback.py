@@ -170,3 +170,47 @@ def test_真实OCR引擎可用时图片页能正常处理(image_pdf):
     # 空白图片可能识别不出文字，因此只断言：不抛异常、返回列表、报告结构完整
     assert isinstance(chunks, list)
     assert "ocr_failed" in report
+
+
+# ---------------- DEF-05：字符混淆与角度分类器 ----------------
+
+def test_修复OCR乘号与摄氏度混淆():
+    """DEF-05：云雀×1 → 云雀X1；-10C → -10℃。"""
+    out = loader._fix_ocr_chars("云雀×1，工作温度：-10C至45C。")
+    assert out == "云雀X1，工作温度：-10℃至45℃。"
+
+
+def test_OCR字符修正不影响正常乘号与型号():
+    """数字之间的乘号（466×466、7×24）和 Type-C 这类型号不能被误改。"""
+    raw = "分辨率 466×466，在线客服 7×24 小时，Type-C 接口。"
+    assert loader._fix_ocr_chars(raw) == raw
+
+
+def test_OCR字符修正只作用于OCR文本(image_pdf):
+    """OCR 识别结果入库前要做字符修正，文本层不受影响。"""
+    fake_text = "云雀×1，工作温度：-10C 至 45℃。"
+    with patch("loader._ocr_image", return_value=fake_text):
+        chunks = loader.load_and_split_pdf(image_pdf)
+
+    text = "".join(c["text"] for c in chunks)
+    assert "云雀X1" in text
+    assert "-10℃" in text
+
+
+def test_OCR引擎关闭角度分类器(monkeypatch):
+    """DEF-05：角度分类器会把横排长行误判为 180°，导致整行识别为空，必须关闭。"""
+    import rapidocr_onnxruntime
+
+    options = {}
+
+    class FakeOCR:
+        def __init__(self, **kwargs):
+            options.update(kwargs)
+
+    monkeypatch.setattr(rapidocr_onnxruntime, "RapidOCR", FakeOCR)
+    monkeypatch.setattr(loader, "_ocr_engine", None)
+    monkeypatch.setattr(loader, "_ocr_error", "")
+
+    loader._get_ocr()
+
+    assert options.get("use_angle_cls") is False

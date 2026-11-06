@@ -89,7 +89,7 @@ _sync_secrets_to_env()
 # noqa 注释是刻意保留的：这里不能把这些 import 提到文件顶部。
 import auth  # noqa: E402
 import db  # noqa: E402
-from loader import FileParseError, load_and_split_file  # noqa: E402
+from loader import FileParseError, load_and_split_file, repair_chunk_text  # noqa: E402
 from qa import (  # noqa: E402
     MODEL,
     QAFriendlyError,
@@ -474,15 +474,6 @@ def _bind_pending_docs(session_id: int):
         st.session_state.pending_doc_ids = []
 
 
-def _doc_summary_of(filename: str) -> dict | None:
-    """从数据库读取某篇文档持久化的摘要（没生成过或已删除则返回 None）。"""
-    try:
-        d = db.get_document_by_name(USER_ID, filename)
-        return d.get("summary") if d else None
-    except Exception:
-        return None
-
-
 def _file_bytes_for_storage(f) -> bytes | None:
     """
     读取上传文件的原始字节用于持久化；超过上限（20MB）返回 None。
@@ -638,10 +629,12 @@ def page_chat():
     st.session_state.session_scope_names = scope_names
 
     # 摘要与推荐问题跟随检索范围展示（持久化在文档上的摘要即时可见）
+    # OBS-02/03：直接用上面已查到的 all_docs，不再按文档逐个查库（去掉 N+1）
+    summaries = {d["filename"]: d.get("summary") for d in all_docs}
     for name in scope_names:
         brief = st.session_state.doc_briefs.get(name)
         if brief is None:
-            brief = _doc_summary_of(name)  # 从数据库读（新增文档或旧会话恢复）
+            brief = summaries.get(name)
         if brief:
             st.session_state.doc_briefs[name] = brief
 
@@ -1004,6 +997,26 @@ def page_documents():
                 for i, chunk in enumerate(preview, start=1):
                     st.markdown(f"**片段 {i} · 第 {chunk['page']} 页**")
                     st.text(chunk["text"])
+
+    # DEF-02：一次性修复已入库旧片段（P2 的断字修复只对新解析文档生效）。
+    # 只处理当前账号自己的片段，只改文本，不重新解析/OCR，可重复执行。
+    st.divider()
+    with st.expander("🔧 数据维护", expanded=False):
+        st.caption(
+            "对已入库的旧片段重新跑一次文本后处理：只修断字"
+            "（如 suppor t@ → support@）和 OCR 字符混淆（如 ×1 → X1、-10C → -10℃），"
+            "不会重新解析或重新 OCR；只影响当前账号，可重复执行。"
+        )
+        if st.button("修复历史片段断字", key="repair_chunks_btn"):
+            with st.spinner("正在检查并修复已入库片段…"):
+                stats = db.repair_chunk_texts(USER_ID, repair_chunk_text)
+            if stats["repaired"]:
+                st.success(
+                    f"已修复 {stats['repaired']} 条片段"
+                    f"（共检查 {stats['checked']} 条）。"
+                )
+            else:
+                st.info(f"检查了 {stats['checked']} 条片段，没有需要修复的内容。")
 
     if st.session_state.get("pending_delete_doc"):
         _confirm_delete_document()
