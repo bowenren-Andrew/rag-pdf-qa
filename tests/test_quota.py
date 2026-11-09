@@ -96,7 +96,7 @@ def test_付费版每日50问_存50个文档_传5个(tmp_db):
     assert snap["remaining_questions"] == 50
     assert snap["remaining_documents"] == 50
     assert snap["remaining_uploads"] == 5
-    assert snap["remaining_summaries"] == 5
+    assert snap["remaining_summaries"] == 20
 
     for _ in range(50):
         quota.record_question(user["id"], on_date=D1)
@@ -148,6 +148,25 @@ def test_免费版摘要每天5次_防止删传来回刷(tmp_db):
     assert ok is False
     assert "今日摘要生成次数已用完" in msg
     assert "每天最多 5 次" in msg
+
+
+def test_付费版摘要每天20次_第21次被拦(tmp_db):
+    user = _user("quota_paid_summary")
+    db.set_user_tier(user["id"], "paid")
+    for _ in range(19):
+        quota.record_summary(user["id"], on_date=D1)
+
+    assert quota.check_summary(quota.snapshot(user["id"], "paid", on_date=D1))[0] is True
+
+    quota.record_summary(user["id"], on_date=D1)
+    snap = quota.snapshot(user["id"], "paid", on_date=D1)
+    assert snap["remaining_summaries"] == 0
+    ok, msg = quota.check_summary(snap)
+    assert ok is False
+    assert "今日摘要生成次数已用完" in msg
+    assert "付费版每天最多 20 次" in msg
+    assert "5 次" not in msg
+    assert quota.check_summary(quota.snapshot(user["id"], "paid", on_date=D2))[0] is True
 
 
 def test_北京时间0点跨日用量清零():

@@ -7,7 +7,7 @@ quota.py（v3.8）
 - free：每天 5 次提问；总共最多存 3 个文档；每天最多新传 1 个文档；
         每天最多生成 5 次摘要（防止删了传、传了删来回刷）。
 - paid（9.9/月）：每天 50 次提问；总共最多存 50 个文档；
-        每天最多新传 5 个文档；摘要随文档上传生成，不再宣传「不限」。
+        每天最多新传 5 个文档；每天最多生成 20 次摘要。
 - 每天 0 点清零：日期按北京时间取 YYYY-MM-DD，只查当天行，不需要定时任务。
 """
 from datetime import datetime, timedelta, timezone
@@ -21,7 +21,7 @@ TIER_PAID = "paid"
 TIER_LABELS = {TIER_FREE: "免费版", TIER_PAID: "付费版"}
 
 # 摘要与每次上传文档绑定：免费版允许 5 次重试；付费版每天最多新传 5 个文档，
-# 因此摘要日上限同样取 5，不对外写「不限」。
+# 摘要日上限单独放宽到 20 次，不对外写「不限」。
 TIER_LIMITS = {
     TIER_FREE: {
         "questions": 5,
@@ -33,7 +33,7 @@ TIER_LIMITS = {
         "questions": 50,
         "documents": 50,
         "uploads": 5,
-        "summaries": 5,
+        "summaries": 20,
     },
 }
 
