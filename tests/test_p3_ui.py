@@ -65,7 +65,7 @@ def _fail_stream(*args, **kwargs):
 def test_问答页显示当前模型名(tmp_db, fernet_key):
     at = _open_chat(tmp_db, "p3_model")
 
-    assert any("回答模型：deepseek-chat" in c.value for c in at.caption)
+    assert any("回答模型：deepseek-flash" in c.value for c in at.caption)
 
 
 def test_回答后显示token用量与估算费用且不残留思考中(tmp_db, fernet_key):
@@ -124,5 +124,5 @@ def test_首屏加载骨架不会残留(tmp_db, fernet_key):
     """骨架屏只在首次加载阶段显示，脚本跑完后必须清掉且不再重复出现。"""
     at = _open_chat(tmp_db, "p3_boot")
 
-    assert "正在加载 PDF 智能问答" not in _body(at)
+    assert "正在加载课程资料问答助手" not in _body(at)
     assert at.session_state["app_booted"] is True

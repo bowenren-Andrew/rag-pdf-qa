@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-app.py（v3.4）
+app.py（v3.7 外观改版）
 职责：Streamlit 界面（单一职责：只做交互与展示，业务逻辑在 auth/db/loader/vectorstore/qa）。
 - v3 变更：新增账号体系（注册/登录）、session_state 保存当前用户；
           知识库与会话按 user_id 隔离；每位用户使用自己的 DeepSeek Key。
@@ -16,6 +16,8 @@ app.py（v3.4）
           解析时显示真实阶段进度（抽取 / OCR / 入库 / 摘要）与耗时预期；
           应用内首屏加载骨架（平台休眠页不可改，见 README/交付说明）；
           展示实际调用模型、每轮 token 用量与估算费用（问答与摘要）。
+- v3.7 变更（仅外观）：浅色学习风主题、900px 居中阅读区、顶部品牌栏、
+          上传虚线卡片、左右对话气泡、摘要卡与引用出处 pill；业务逻辑与接口不变。
 - 页面结构（st.navigation 多页面）：
   1) 💬 问答      —— 聊天、流式回答、引用原文与相似度、文档摘要与推荐问题、会话管理
   2) 📁 我的文档  —— 上传 PDF / PPTX 入库（查重、存库）、已入库列表与删除
@@ -37,7 +39,7 @@ MAX_FILE_BYTES = 20 * 1024 * 1024
 MAX_QUESTION_CHARS = 2000
 
 st.set_page_config(
-    page_title="PDF 智能问答",
+    page_title="课程资料问答助手",
     page_icon="📄",
     layout="wide",
     initial_sidebar_state="expanded",
@@ -55,7 +57,7 @@ if "app_booted" not in st.session_state:
         <div style="display:flex;flex-direction:column;align-items:center;justify-content:center;
                     min-height:52vh;gap:12px;color:#6B7280;">
           <div style="font-size:40px">📄</div>
-          <div style="font-size:18px;font-weight:600;color:#374151">正在加载 PDF 智能问答…</div>
+          <div style="font-size:18px;font-weight:600;color:#374151">正在加载课程资料问答助手…</div>
           <div style="font-size:13px">首次唤醒通常需要 10–20 秒，请稍候；之后会明显更快。</div>
           <div style="width:220px;height:4px;border-radius:2px;background:#E5E7EB;overflow:hidden">
             <div style="width:45%;height:100%;background:#2563EB;border-radius:2px"></div>
@@ -106,6 +108,7 @@ from ui_helpers import (  # noqa: E402
     parse_progress_label,
     reveal_on_first_chunk,
 )
+from ui_theme import inject_theme, render_topbar  # noqa: E402
 from vectorstore import (  # noqa: E402
     add_document,
     delete_document,
@@ -130,40 +133,8 @@ if _boot_placeholder is not None:
     st.session_state["app_booted"] = True
 
 
-# ---------- 极少量自定义 CSS：只做圆角、分隔线与卡片阴影，不加动画 ----------
-CUSTOM_CSS = """
-<style>
-  /* 主标题区渐变分隔线 */
-  .title-divider {
-    height: 3px;
-    border-radius: 3px;
-    margin: 6px 0 18px 0;
-    background: linear-gradient(90deg, #2563EB 0%, #60A5FA 55%, rgba(37,99,235,0) 100%);
-  }
-  /* 登录/注册卡片：圆角 + 浅阴影 */
-  .login-card {
-    background: #FFFFFF;
-    border: 1px solid #E5E7EB;
-    border-radius: 16px;
-    box-shadow: 0 2px 14px rgba(15, 23, 42, 0.06);
-    padding: 8px 24px 20px 24px;
-  }
-  /* 主要按钮圆角 */
-  .stButton > button, .stFormSubmitButton > button {
-    border-radius: 10px;
-  }
-  /* 侧边栏用户区：圆形头像 + 用户名 */
-  .user-chip { display: flex; align-items: center; gap: 10px; margin-bottom: 6px; }
-  .avatar {
-    width: 34px; height: 34px; border-radius: 50%;
-    background: #2563EB; color: #FFFFFF;
-    display: flex; align-items: center; justify-content: center;
-    font-size: 15px; font-weight: 600; flex: none;
-  }
-  .user-name { font-size: 14px; font-weight: 600; color: #111827; }
-</style>
-"""
-st.markdown(CUSTOM_CSS, unsafe_allow_html=True)
+# ---------- 外观主题：只改样式，不改变任何业务逻辑 ----------
+inject_theme()
 
 
 # ---------- 会话状态初始化 ----------
@@ -189,35 +160,37 @@ if "session_id" not in st.session_state:
 # ---------- 登录 / 注册页 ----------
 def render_auth_page():
     """未登录时展示的居中登录/注册卡片。"""
-    left, mid, right = st.columns([1, 1.4, 1])
+    left, mid, right = st.columns([1, 1.6, 1])
     with mid:
-        st.markdown('<div class="title-divider"></div>', unsafe_allow_html=True)
-        st.markdown("## 📄 PDF 智能问答")
-        st.caption("上传 PDF → 自动摘要与推荐问题 → 流式问答，答案附带原文出处与相似度")
-        st.markdown('<div class="login-card">', unsafe_allow_html=True)
+        st.markdown(
+            '<div class="wb-auth-head"><div class="wb-brand">'
+            '<span class="wb-brand-mark">📄</span>课程资料问答助手</div></div>'
+            '<div class="wb-auth-sub">上传 PDF → 自动摘要与推荐问题 → 流式问答，'
+            "答案附带原文出处与相似度</div>",
+            unsafe_allow_html=True,
+        )
 
         # 用 radio 代替 tabs：注册成功后可以直接切回登录页并回填用户名。
         # 切换发生在下一次 rerun、radio 实例化之前，避免直接改 widget state 被忽略。
-        if st.session_state.pop("_switch_to_login", False):
-            # 在 radio 实例化之前写入值，前后端都会显示「登录」；直接 pop 会让
-            # 前端仍保留「注册」的选中态，与已渲染的登录表单不一致。
-            st.session_state["auth_mode"] = "登录"
-        mode = st.radio(
-            "账号操作",
-            ["登录", "注册"],
-            horizontal=True,
-            label_visibility="collapsed",
-            key="auth_mode",
-        )
-        notice = st.session_state.pop("auth_notice", None)
-        if notice:
-            st.success(notice)
-        if mode == "登录":
-            render_login_form()
-        else:
-            render_register_form()
-
-        st.markdown("</div>", unsafe_allow_html=True)
+        with st.container(border=True, key="auth_card"):
+            if st.session_state.pop("_switch_to_login", False):
+                # 在 radio 实例化之前写入值，前后端都会显示「登录」；直接 pop 会让
+                # 前端仍保留「注册」的选中态，与已渲染的登录表单不一致。
+                st.session_state["auth_mode"] = "登录"
+            mode = st.radio(
+                "账号操作",
+                ["登录", "注册"],
+                horizontal=True,
+                label_visibility="collapsed",
+                key="auth_mode",
+            )
+            notice = st.session_state.pop("auth_notice", None)
+            if notice:
+                st.success(notice)
+            if mode == "登录":
+                render_login_form()
+            else:
+                render_register_form()
 
 
 def render_login_form():
@@ -301,7 +274,7 @@ def render_sidebar_user():
             f'<span class="user-name">{user["username"]}</span></div>',
             unsafe_allow_html=True,
         )
-        if st.button("退出登录", use_container_width=True):
+        if st.button("退出登录", use_container_width=True, key="logout_btn"):
             st.session_state.user = None
             _reset_chat_state()
             st.rerun()
@@ -316,6 +289,7 @@ if st.session_state.user is None:
 render_sidebar_user()
 
 USER_ID = st.session_state.user["id"]
+render_topbar()
 
 
 def _drop_doc_from_session_state(doc_id: int, name: str):
@@ -422,17 +396,22 @@ def _require_key_or_guide() -> str:
 
 # ---------- 通用组件 ----------
 def render_sources(sources: list[dict]):
-    """折叠展示命中的原文片段及相似度分数（PDF 用「页」，PPTX 用「张」）。"""
-    with st.expander("📚 命中原文片段与相似度"):
+    """用 [1][2] 小 pill 展示引用出处，点击展开原文与相似度（PDF 页 / PPTX 张）。"""
+    if not sources:
+        return
+    st.markdown('<div class="wb-source-label">引用出处</div>', unsafe_allow_html=True)
+    with st.container(horizontal=True, gap="small", wrap=True):
         for i, s in enumerate(sources, start=1):
             # Chroma 返回的是余弦距离（越小越相似），换算成百分比相似度展示
             sim = max(0.0, 1.0 - float(s["score"])) * 100
             unit = "张" if s.get("doc_type") == "pptx" else "页"
-            st.markdown(
-                f"**【片段{i}】** {escape_markdown(s['source'])} · 第 {s['page']} {unit} · 相似度 **{sim:.1f}%**"
-            )
-            st.caption(s["text"])
-            st.progress(min(max(sim / 100.0, 0.0), 1.0))
+            with st.popover(f"[{i}]"):
+                st.markdown(
+                    f"**{escape_markdown(s['source'])}** · 第 {s['page']} {unit} · "
+                    f"相似度 **{sim:.1f}%**"
+                )
+                st.caption(s["text"])
+                st.progress(min(max(sim / 100.0, 0.0), 1.0))
 
 
 def save_current_session():
@@ -529,8 +508,6 @@ def _on_send_click():
 
 def page_chat():
     """问答页：聊天窗口、流式回答、引用来源、摘要推荐问题、会话管理。"""
-    st.markdown('<div class="title-divider"></div>', unsafe_allow_html=True)
-
     # P3：点击「发送」后 Streamlit 要重跑整个脚本（线上约 3–4 秒）才会渲染到聊天区，
     # 这段时间页面顶部先给出「思考中」，避免看起来没反应。
     _ask_banner = None
@@ -546,7 +523,7 @@ def page_chat():
     # 会话管理（数据来自数据库，只查当前用户的）
     with st.sidebar:
         st.subheader("💬 会话管理")
-        if st.button("➕ 新建会话", use_container_width=True):
+        if st.button("➕ 新建会话", use_container_width=True, key="new_session_btn"):
             _reset_chat_state()
             st.rerun()
 
@@ -554,7 +531,7 @@ def page_chat():
         if not sessions:
             st.caption("暂无历史会话")
         for s in sessions:
-            cols = st.columns([0.62, 0.19, 0.19])
+            cols = st.columns([0.52, 0.24, 0.24])
             flag = "✅ " if s["id"] == st.session_state.session_id else ""
             cols[0].write(f"{flag}{s.get('title', '未命名会话')}")
             if cols[1].button("加载", key=f"load_{s['id']}"):
@@ -639,60 +616,97 @@ def page_chat():
         if brief:
             st.session_state.doc_briefs[name] = brief
 
-    # 主区：上次入库生成的摘要与推荐问题
-    for name, brief in st.session_state.doc_briefs.items():
-        with st.expander(f"📝 《{escape_markdown(name)}》全文摘要与推荐问题", expanded=False):
+    # 主区：上次入库生成的摘要与推荐问题（浅灰卡 + 左侧蓝色竖线）
+    for idx, (name, brief) in enumerate(st.session_state.doc_briefs.items()):
+        with st.container(border=True, key=f"summary_card_{idx}"):
+            st.markdown(f"**📄 《{escape_markdown(name)}》 · 全文摘要**")
             st.markdown(brief.get("summary", ""))
             if brief.get("usage"):
                 st.caption("📊 摘要生成 · " + format_usage(brief["usage"]))
-            questions = brief.get("questions") or []
+            questions = (brief.get("questions") or [])[:3]
             if questions:
-                st.markdown("**推荐问题（点击直接提问）**")
+                st.markdown(
+                    '<div class="wb-suggest-label">推荐问题</div>',
+                    unsafe_allow_html=True,
+                )
                 for i, q in enumerate(questions):
-                    if st.button(q, key=f"sug_{name}_{i}"):
+                    if st.button(
+                        q, key=f"sug_{name}_{i}", use_container_width=True
+                    ):
                         st.session_state.pending_question = q
 
-    st.subheader(f"💬 当前会话：{st.session_state.session_title}")
+    st.markdown(
+        f"#### 💬 当前会话：{escape_markdown(st.session_state.session_title)}"
+    )
     # P3：让用户随时看到当前请求的模型名；每轮回答后另附 API 实际返回的用量与估算费用。
     st.caption(
-        f"回答模型：{MODEL}（请求名，实际服务模型见每轮用量行）"
+        "回答模型：deepseek-flash"
         " · token 用量来自 API 返回的 usage，费用为官方价目估算"
     )
 
-    # 渲染历史消息（含引用来源）
-    for msg in st.session_state.messages:
-        with st.chat_message(msg["role"]):
-            st.markdown(msg["content"])
-            if msg.get("usage"):
-                st.caption("📊 " + format_usage(msg["usage"]))
-            if msg.get("sources"):
-                render_sources(msg["sources"])
+    # 空状态：居中提示 + 示例文档入口
+    if not st.session_state.messages:
+        if all_docs:
+            empty_title = "可以开始提问了"
+            empty_text = (
+                "当前知识库已有文档。在下方输入问题，或先查看上方的文档摘要与推荐问题。"
+            )
+            link_label = "管理我的文档"
+        else:
+            empty_title = "从一份课程文档开始"
+            empty_text = (
+                "上传 PDF 或 PPTX，自动生成摘要与推荐问题；提问后答案会标注原文出处，"
+                "点击 [1] 可查看原文片段。"
+            )
+            link_label = "上传示例文档"
+        with st.container(key="empty_state"):
+            st.markdown(
+                '<div class="wb-empty"><div class="wb-empty-icon">💬</div>'
+                f"<h3>{empty_title}</h3><p>{empty_text}</p></div>",
+                unsafe_allow_html=True,
+            )
+            with st.container(key="empty_action"):
+                st.page_link(PAGES[1], label=link_label, icon="📁")
+    else:
+        # 渲染历史消息（含引用来源）
+        with st.container(key="chat_thread"):
+            for msg in st.session_state.messages:
+                with st.chat_message(msg["role"]):
+                    st.markdown(msg["content"])
+                    if msg.get("usage"):
+                        st.caption("📊 " + format_usage(msg["usage"]))
+                    if msg.get("sources"):
+                        render_sources(msg["sources"])
 
     # BUG-08：输入框下方实时显示「已输入 / 上限」，超过上限时提示并禁用发送。
-    input_col, button_col = st.columns([0.85, 0.15])
-    typed = input_col.text_area(
-        "请输入你的问题…",
-        placeholder=f"最多 {MAX_QUESTION_CHARS} 字",
-        height=90,
-        key="question_input",
-        label_visibility="collapsed",
-    )
-    typed = typed or ""
-    question_len = len(typed)
-    too_long = question_len > MAX_QUESTION_CHARS
-    if too_long:
-        st.warning(
-            f"问题已输入 {question_len} 字，超过上限 {MAX_QUESTION_CHARS} 字，"
-            "请删减后再发送。"
+    with st.container(key="chat_composer"):
+        input_col, button_col = st.columns(
+            [0.85, 0.15], vertical_alignment="bottom"
         )
-    st.caption(f"已输入 {question_len} / {MAX_QUESTION_CHARS} 字")
-    submitted = button_col.button(
-        "发送",
-        type="primary",
-        use_container_width=True,
-        disabled=not typed.strip() or too_long,
-        on_click=_on_send_click,
-    )
+        typed = input_col.text_area(
+            "请输入你的问题…",
+            placeholder=f"最多 {MAX_QUESTION_CHARS} 字",
+            height=90,
+            key="question_input",
+            label_visibility="collapsed",
+        )
+        typed = typed or ""
+        question_len = len(typed)
+        too_long = question_len > MAX_QUESTION_CHARS
+        if too_long:
+            st.warning(
+                f"问题已输入 {question_len} 字，超过上限 {MAX_QUESTION_CHARS} 字，"
+                "请删减后再发送。"
+            )
+        st.caption(f"已输入 {question_len} / {MAX_QUESTION_CHARS} 字")
+        submitted = button_col.button(
+            "发送",
+            type="primary",
+            use_container_width=True,
+            disabled=not typed.strip() or too_long,
+            on_click=_on_send_click,
+            key="send_btn",
+        )
     if submitted:
         typed = (typed or "").strip()
         if not typed:
@@ -816,8 +830,7 @@ def handle_question(question: str) -> bool:
 # ---------- 页面二：📁 我的文档 ----------
 def page_documents():
     """文档页：多文件上传入库（PDF / PPTX，查重）、已入库列表、逐文档删除。"""
-    st.markdown('<div class="title-divider"></div>', unsafe_allow_html=True)
-    st.subheader("📁 我的文档")
+    st.markdown("## 📁 我的文档")
     st.caption(
         "支持 PDF（含扫描件，图片页会自动 OCR 识别）与 PPTX；"
         "上传的文档只会进入你自己的知识库，其他用户看不到。"
@@ -826,36 +839,45 @@ def page_documents():
     if flash:
         st.success(flash)
 
-    uploaded_files = st.file_uploader(
-        "上传 PDF 或 PPTX（可多选）",
-        accept_multiple_files=True,
-        help="仅支持 PDF 与 PPTX；其他格式会在提交时提示，不会入库。",
-    )
-    # 不在 file_uploader 里限制 type：Streamlit 自带的英文报错无法改成中文，
-    # 改为选中后由我们校验后缀并给出中文提示。
-    unsupported_uploads = [
-        f
-        for f in (uploaded_files or [])
-        if os.path.splitext(f.name)[1].lower() not in (".pdf", ".pptx")
-    ]
-    if unsupported_uploads:
-        names = "、".join(f"《{escape_markdown(f.name)}》" for f in unsupported_uploads)
-        st.warning(f"{names}格式不支持，仅支持 PDF 与 PPTX，请移除后重新上传。")
-
-    # 强制全文 OCR 开关：默认关闭，勾选后对 PDF 的每一页都做 OCR（对 PPTX 无效）
-    force_ocr = False
-    if uploaded_files:
-        force_ocr = st.checkbox(
-            "该文件含大量数学公式或扫描质量差，强制全文 OCR（较慢、更占内存，大文件慎用）",
-            value=False,
-            help=(
-                "适用于 LaTeX 导出的课件/作业：这类 PDF 能提取到文字，但公式位置是空白，"
-                "常规规则（整页少于 10 字才 OCR）不会触发。勾选后忽略文本层、逐页识别，"
-                "普通 PDF 请不要勾选。仅对 PDF 生效。"
-            ),
+    parse_clicked = False
+    with st.container(border=True, key="upload_card"):
+        st.markdown("#### 上传文档")
+        st.caption("支持 PDF / PPTX，可多选；上传后自动解析并入库到你的个人知识库。")
+        uploaded_files = st.file_uploader(
+            "上传 PDF 或 PPTX（可多选）",
+            accept_multiple_files=True,
+            help="仅支持 PDF 与 PPTX；其他格式会在提交时提示，不会入库。",
         )
+        # 不在 file_uploader 里限制 type：Streamlit 自带的英文报错无法改成中文，
+        # 改为选中后由我们校验后缀并给出中文提示。
+        unsupported_uploads = [
+            f
+            for f in (uploaded_files or [])
+            if os.path.splitext(f.name)[1].lower() not in (".pdf", ".pptx")
+        ]
+        if unsupported_uploads:
+            names = "、".join(
+                f"《{escape_markdown(f.name)}》" for f in unsupported_uploads
+            )
+            st.warning(f"{names}格式不支持，仅支持 PDF 与 PPTX，请移除后重新上传。")
 
-    if uploaded_files and st.button("解析并入库", type="primary"):
+        # 强制全文 OCR 开关：默认关闭，勾选后对 PDF 的每一页都做 OCR（对 PPTX 无效）
+        force_ocr = False
+        if uploaded_files:
+            force_ocr = st.checkbox(
+                "该文件含大量数学公式或扫描质量差，强制全文 OCR（较慢、更占内存，大文件慎用）",
+                value=False,
+                help=(
+                    "适用于 LaTeX 导出的课件/作业：这类 PDF 能提取到文字，但公式位置是空白，"
+                    "常规规则（整页少于 10 字才 OCR）不会触发。勾选后忽略文本层、逐页识别，"
+                    "普通 PDF 请不要勾选。仅对 PDF 生效。"
+                ),
+            )
+            parse_clicked = st.button(
+                "解析并入库", type="primary", key="upload_submit_btn"
+            )
+
+    if uploaded_files and parse_clicked:
         api_key = _current_api_key()  # 摘要生成需要 Key，没有则跳过摘要
         for f in uploaded_files:
             if os.path.splitext(f.name)[1].lower() not in (".pdf", ".pptx"):
@@ -977,27 +999,30 @@ def page_documents():
         icon = "📊" if d.get("doc_type") == "pptx" else "📄"
         in_session = "✅ " if d["id"] in bound_ids else ""
         size_mb = (d.get("file_size") or 0) / (1024 * 1024)
-        cols = st.columns([0.72, 0.28])
-        cols[0].write(
-            f"{icon} {in_session}{escape_markdown(name)} · {d.get('chunk_count', 0)} 片段"
-            + (f" · {size_mb:.1f}MB" if size_mb >= 0.1 else "")
-        )
-        if cols[1].button("删除", key=f"del_doc_{name}"):
-            # 只记录待删目标，弹窗确认后才真正删除
-            st.session_state.pending_delete_doc = {"id": d["id"], "name": name}
+        with st.container(border=True, key=f"doc_card_{d['id']}"):
+            cols = st.columns([0.72, 0.28], vertical_alignment="center")
+            cols[0].write(
+                f"{icon} {in_session}{escape_markdown(name)} · {d.get('chunk_count', 0)} 片段"
+                + (f" · {size_mb:.1f}MB" if size_mb >= 0.1 else "")
+            )
+            if cols[1].button("删除", key=f"del_doc_{name}"):
+                # 只记录待删目标，弹窗确认后才真正删除
+                st.session_state.pending_delete_doc = {"id": d["id"], "name": name}
 
-        # BUG-10：展示入库后的实际切分文本，便于核对断字与 OCR 质量。
-        preview = db.list_document_chunks_preview(USER_ID, d["id"], limit=3)
-        total = d.get("chunk_count", 0)
-        if preview:
-            with st.expander(
-                f"🔍 《{escape_markdown(name)}》片段预览（前 {len(preview)} / {total} 段）",
-                expanded=False,
-            ):
-                st.caption("以下为入库后的实际片段文本；扫描件展示的是 OCR 后的结果。")
-                for i, chunk in enumerate(preview, start=1):
-                    st.markdown(f"**片段 {i} · 第 {chunk['page']} 页**")
-                    st.text(chunk["text"])
+            # BUG-10：展示入库后的实际切分文本，便于核对断字与 OCR 质量。
+            preview = db.list_document_chunks_preview(USER_ID, d["id"], limit=3)
+            total = d.get("chunk_count", 0)
+            if preview:
+                with st.expander(
+                    f"🔍 《{escape_markdown(name)}》片段预览（前 {len(preview)} / {total} 段）",
+                    expanded=False,
+                ):
+                    st.caption(
+                        "以下为入库后的实际片段文本；扫描件展示的是 OCR 后的结果。"
+                    )
+                    for i, chunk in enumerate(preview, start=1):
+                        st.markdown(f"**片段 {i} · 第 {chunk['page']} 页**")
+                        st.text(chunk["text"])
 
     # DEF-02：一次性修复已入库旧片段（P2 的断字修复只对新解析文档生效）。
     # 只处理当前账号自己的片段，只改文本，不重新解析/OCR，可重复执行。
@@ -1026,94 +1051,96 @@ def page_documents():
 # ---------- 页面三：⚙️ 设置 ----------
 def page_settings():
     """设置页：账号信息、API Key 管理（加密 + 掩码）、修改密码。"""
-    st.markdown('<div class="title-divider"></div>', unsafe_allow_html=True)
-    st.subheader("⚙️ 设置")
+    st.markdown("## ⚙️ 设置")
 
     user = db.get_user_by_id(USER_ID) or {}
     created = user.get("created_at")
     created_str = created.strftime("%Y-%m-%d %H:%M") if created else "-"
 
-    st.markdown("**账号信息**")
-    info_cols = st.columns(2)
-    info_cols[0].text_input("用户名", value=st.session_state.user["username"], disabled=True)
-    info_cols[1].text_input("注册时间", value=created_str, disabled=True)
-
-    st.divider()
-    st.markdown("**DeepSeek API Key**")
-    current_key = _current_api_key()
-    st.code(auth.mask_key(current_key), language=None)
-    st.caption(
-        "Key 使用 Fernet 加密后保存，只有你自己能用。"
-        "申请地址：[platform.deepseek.com](https://platform.deepseek.com/)"
-    )
-
-    # P3-2：保存成功或删除后清空 Key 输入框，避免明文留在前端 widget 状态里。
-    # 只 pop 旧 key 在真实浏览器里不会让已挂载的 input 清空（AppTest 看不出差异），
-    # 所以这里递增版本号换一个新的 widget key，强制前端重新挂载空输入框。
-    if st.session_state.pop("_reset_api_key_input", False):
-        st.session_state["_api_key_input_version"] = (
-            st.session_state.get("_api_key_input_version", 0) + 1
+    with st.container(border=True, key="settings_account"):
+        st.markdown("**账号信息**")
+        info_cols = st.columns(2)
+        info_cols[0].text_input(
+            "用户名", value=st.session_state.user["username"], disabled=True
         )
-        for stale_key in [
-            k for k in list(st.session_state.keys())
-            if k.startswith("new_api_key_input")
-        ]:
-            st.session_state.pop(stale_key, None)
+        info_cols[1].text_input("注册时间", value=created_str, disabled=True)
 
-    api_key_widget_key = (
-        f"new_api_key_input_{st.session_state.get('_api_key_input_version', 0)}"
-    )
-
-    with st.form("api_key_form"):
-        new_key = st.text_input(
-            "填入新的 Key",
-            type="password",
-            placeholder="sk-...",
-            help="保存后会覆盖旧 Key",
-            key=api_key_widget_key,
+    with st.container(border=True, key="settings_key"):
+        st.markdown("**DeepSeek API Key**")
+        current_key = _current_api_key()
+        st.code(auth.mask_key(current_key), language=None)
+        st.caption(
+            "Key 使用 Fernet 加密后保存，只有你自己能用。"
+            "申请地址：[platform.deepseek.com](https://platform.deepseek.com/)"
         )
-        saved = st.form_submit_button("保存 Key", type="primary")
-    if saved:
-        try:
-            # 先校验格式，再调一次轻量鉴权接口（GET /models，不消耗 token），
-            # 两步都通过才加密落库，避免把坏 Key 存进去。
-            ok, msg = auth.validate_api_key_format(new_key)
-            if not ok:
-                raise auth.AuthFriendlyError(msg)
-            with st.spinner("正在验证 Key 是否有效…"):
-                verify_api_key(new_key)
-            masked = auth.set_user_api_key(USER_ID, new_key)
-            st.session_state["_reset_api_key_input"] = True
-            st.success(f"Key 已验证并加密保存（{masked}）")
-            st.rerun()
-        except (auth.AuthFriendlyError, QAFriendlyError) as e:
-            st.error(str(e))
 
-    if current_key and st.button("删除已保存的 Key"):
-        auth.delete_user_api_key(USER_ID)
-        st.session_state["_reset_api_key_input"] = True
-        st.success("已删除保存的 Key，需要时可重新填写。")
-        st.rerun()
+        # P3-2：保存成功或删除后清空 Key 输入框，避免明文留在前端 widget 状态里。
+        # 只 pop 旧 key 在真实浏览器里不会让已挂载的 input 清空（AppTest 看不出差异），
+        # 所以这里递增版本号换一个新的 widget key，强制前端重新挂载空输入框。
+        if st.session_state.pop("_reset_api_key_input", False):
+            st.session_state["_api_key_input_version"] = (
+                st.session_state.get("_api_key_input_version", 0) + 1
+            )
+            for stale_key in [
+                k for k in list(st.session_state.keys())
+                if k.startswith("new_api_key_input")
+            ]:
+                st.session_state.pop(stale_key, None)
 
-    st.divider()
-    st.markdown("**修改密码**")
-    with st.form("password_form"):
-        old_password = st.text_input("当前密码", type="password")
-        new_password = st.text_input("新密码", type="password", help="至少 8 位")
-        confirm_password = st.text_input("确认新密码", type="password")
-        changed = st.form_submit_button("修改密码")
-    if changed:
-        if new_password != confirm_password:
-            st.error("两次输入的新密码不一致。")
-        else:
-            ok, msg = auth.change_password(USER_ID, old_password, new_password)
-            if ok:
-                st.success(msg)
-                st.session_state.user = None  # 修改成功后要求重新登录
-                _reset_chat_state()
+        api_key_widget_key = (
+            f"new_api_key_input_{st.session_state.get('_api_key_input_version', 0)}"
+        )
+
+        with st.form("api_key_form"):
+            new_key = st.text_input(
+                "填入新的 Key",
+                type="password",
+                placeholder="sk-...",
+                help="保存后会覆盖旧 Key",
+                key=api_key_widget_key,
+            )
+            saved = st.form_submit_button("保存 Key", type="primary")
+        if saved:
+            try:
+                # 先校验格式，再调一次轻量鉴权接口（GET /models，不消耗 token），
+                # 两步都通过才加密落库，避免把坏 Key 存进去。
+                ok, msg = auth.validate_api_key_format(new_key)
+                if not ok:
+                    raise auth.AuthFriendlyError(msg)
+                with st.spinner("正在验证 Key 是否有效…"):
+                    verify_api_key(new_key)
+                masked = auth.set_user_api_key(USER_ID, new_key)
+                st.session_state["_reset_api_key_input"] = True
+                st.success(f"Key 已验证并加密保存（{masked}）")
                 st.rerun()
+            except (auth.AuthFriendlyError, QAFriendlyError) as e:
+                st.error(str(e))
+
+        if current_key and st.button("删除已保存的 Key", key="delete_key_btn"):
+            auth.delete_user_api_key(USER_ID)
+            st.session_state["_reset_api_key_input"] = True
+            st.success("已删除保存的 Key，需要时可重新填写。")
+            st.rerun()
+
+    with st.container(border=True, key="settings_password"):
+        st.markdown("**修改密码**")
+        with st.form("password_form"):
+            old_password = st.text_input("当前密码", type="password")
+            new_password = st.text_input("新密码", type="password", help="至少 8 位")
+            confirm_password = st.text_input("确认新密码", type="password")
+            changed = st.form_submit_button("修改密码")
+        if changed:
+            if new_password != confirm_password:
+                st.error("两次输入的新密码不一致。")
             else:
-                st.error(msg)
+                ok, msg = auth.change_password(USER_ID, old_password, new_password)
+                if ok:
+                    st.success(msg)
+                    st.session_state.user = None  # 修改成功后要求重新登录
+                    _reset_chat_state()
+                    st.rerun()
+                else:
+                    st.error(msg)
 
 
 # ---------- 多页面导航 ----------

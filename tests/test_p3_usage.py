@@ -76,7 +76,7 @@ def test_usage_to_dict_只有prompt_tokens_details时也能读缓存命中():
     result = usage_to_dict(usage)
     assert result["prompt_cache_hit_tokens"] == 30
     assert result["prompt_cache_miss_tokens"] == 70
-    assert result["model"] == "deepseek-chat"
+    assert result["model"] == "deepseek-flash"
 
 
 def test_usage_to_dict_缺字段时给0():

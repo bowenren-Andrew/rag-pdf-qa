@@ -35,9 +35,8 @@ from openai import (
 
 # DeepSeek 官方接口（OpenAI 兼容）
 BASE_URL = "https://api.deepseek.com"
-# 请求使用的模型名。deepseek-chat 是历史别名，实际服务的模型以响应中的 model 字段为准，
-# 界面展示的也是响应返回值（不把猜测写死）。
-MODEL = "deepseek-chat"
+# 请求使用的官方模型 ID：deepseek-flash（2026-07-24 起官方新请求统一使用该 ID）。
+MODEL = "deepseek-flash"
 
 # ---------------- P3：用量与费用估算 ----------------
 # 官方价目（人民币 / 百万 tokens），来源：DeepSeek 开放平台「模型 & 价格」页（2026-11 查询）。

@@ -1,4 +1,4 @@
-# 📄 基于 RAG 的 PDF 智能问答助手
+# 📄 基于 RAG 的课程资料问答助手
 
 > 🔗 在线体验：https://ren-rag-pdf.streamlit.app/
 
@@ -112,7 +112,7 @@
 | OCR | rapidocr-onnxruntime（RapidOCR） | 中文识别，模型随包内置，懒加载 |
 | 向量模型 | sentence-transformers · `BAAI/bge-small-zh-v1.5` | 中文语义向量，约 100MB，输出 512 维 |
 | 向量存储 | 数据库 `document_chunks` 表 | 云端 Postgres + **pgvector**（SQL 余弦距离）；本地 sqlite 存 float32 字节、numpy 算余弦，两条路径结果一致 |
-| 大模型 | DeepSeek（`deepseek-chat`） | OpenAI 兼容 SDK，支持流式 |
+| 大模型 | DeepSeek（`deepseek-flash`） | OpenAI 兼容 SDK，支持流式 |
 | 数据库 | SQLAlchemy + sqlite / Postgres | 本地 sqlite，云端接 Supabase Postgres |
 | 密码与加密 | hashlib.pbkdf2_hmac + cryptography.Fernet | 密码加盐哈希，用户 Key 对称加密 |
 | 配置 | python-dotenv | 从 `.env` 读取 `DATABASE_URL` / `APP_SECRET_KEY` |
@@ -144,7 +144,7 @@ flowchart TD
     F --> J[相似检索 Top-4<br/>仅限本人 collection]
     I --> J
     J --> K[qa.py 拼接提示词]
-    K --> L[DeepSeek deepseek-chat]
+    K --> L[DeepSeek deepseek-flash]
     L --> M[流式输出回答]
     J --> N[折叠展示原文片段<br/>+ 页码 + 相似度]
     M --> O[(sessions 表<br/>按 user_id 隔离)]
