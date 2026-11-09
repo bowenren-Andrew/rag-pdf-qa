@@ -1,6 +1,6 @@
-# 部署指南：GitHub → Streamlit Cloud → 访问密码
+# 部署指南：GitHub → Streamlit Cloud → 平台 Key 与免费额度
 
-本文档记录本项目从本地代码到「公网可访问 + 密码保护」的完整过程。
+本文档记录本项目从本地代码到「公网可访问 + 账号登录 + 平台 Key 额度」的完整过程。
 按文档顺序操作即可，每一步都写明了"在哪点、填什么、看到什么算成功"。
 
 ---
@@ -15,9 +15,9 @@
 | GitHub 仓库创建 | ✅ 已完成 | **私有仓库**：https://github.com/bowenren-Andrew/rag-pdf-qa |
 | 代码推送 | ✅ 已完成 | 分支 `master`，已同步远程 |
 | 敏感文件核查 | ✅ 已确认 | 远程仓库**只有** `.env.example`（模板），真实 `.env` 未上传 |
-| 访问密码功能 | ✅ 已写入 `app.py` | 可选开关，不配置就完全不启用 |
+| 账号登录 + 平台 Key | ✅ 已写入 `app.py` | 注册即可用，无需自备 Key；老用户可自填覆盖 |
 | Streamlit Cloud 部署 | ⬜ 待你操作 | 见「二、部署到 Streamlit Cloud」，约 5 分钟 |
-| 访问密码配置 | ⬜ 待你操作 | 见「三、设置访问密码」，1 分钟 |
+| 平台 Key 配置 | ⬜ 待你操作 | 见「三、设置平台 Key 与 Secrets」，1 分钟 |
 
 已推送的文件清单（19 项）：
 
@@ -107,7 +107,7 @@ https://bowenren-andrew-rag-pdf-qa-app-xxxxxx.streamlit.app
 
 ---
 
-## 三、设置访问密码（1 分钟）
+## 三、设置平台 Key 与 Secrets（1 分钟）
 
 ### 3.1 在云端配置
 
@@ -116,49 +116,49 @@ https://bowenren-andrew-rag-pdf-qa-app-xxxxxx.streamlit.app
 3. 填入 TOML 格式内容：
 
 ```toml
-DEEPSEEK_API_KEY = "sk-你的DeepSeekKey"
-APP_PASSWORD = "你想设置的访问密码"
+DATABASE_URL = "postgresql://postgres.xxxx:你的密码@aws-0-xxx.pooler.supabase.com:5432/postgres"
+APP_SECRET_KEY = "你的Fernet密钥"
+DEEPSEEK_API_KEY = "sk-你自己的DeepSeek官方Key"
 ```
 
 4. 点 **Save**，应用会自动重启（约 1 分钟）
 
-> 改密码：改完 Save 即可；取消密码：删掉 `APP_PASSWORD` 那一行再 Save。
-> 忘记密码：直接看 Secrets（它是明文存储的，只有你自己能看）。
+> `DEEPSEEK_API_KEY` 必须是 DeepSeek **官方** Key（`api.deepseek.com`，模型 `deepseek-flash`），
+> 不要使用临时 trycloudflare 网关。平台 Key 不会显示在页面上，也不会写进日志。
+> 门禁已由账号登录取代，`APP_PASSWORD` 不再使用。
 
-### 3.2 密码功能是怎么生效的（写给要看懂原理的你）
+### 3.2 平台 Key 与额度是怎么生效的
 
-密码读取优先级：**Streamlit Secrets > 系统环境变量 > 项目根目录 `.env`**。
+读取优先级：**Streamlit Secrets > 系统环境变量 > 项目根目录 `.env`**。
 
 ```python
 # app.py（已写好）
-_sync_secrets_to_env()          # ① 把 Secrets 同步进环境变量，云端本地都能读到
+_sync_secrets_to_env()                 # ① 把 Secrets 同步进环境变量
 ↓
-_get_access_password()          # ② 按优先级读密码；读不到 → 返回空 → 不启用
+auth.get_platform_api_key()            # ② 只读 DEEPSEEK_API_KEY
 ↓
-check_password()                # ③ 为空直接放行；非空则渲染登录卡片
+_current_api_key()                     # ③ 用户自填 Key 优先，否则用平台 Key
 ↓
-if not check_password(): st.stop()   # ④ 未通过就停止渲染后面所有内容
+quota.check_question/upload/summary()  # ④ 调用前按当天 daily_usage 行查额度
 ```
 
 关键设计：
 
-- **可选开关**：三个来源都没配 `APP_PASSWORD` 时返回空字符串，函数直接 `return True`，本地开发完全无感
-- **不重复打断**：验证通过写入 `st.session_state["auth_ok"]`，同一浏览器会话内不再重复输入
-- **不落盘**：密码只在内存中比对，不写进任何文件
-- **`st.stop()` 是官方推荐的拦截方式**，比 `return` 更彻底——未通过时连标题和侧边栏都不会渲染
+- **平台 Key 只在服务端读取**：不写进代码、不写进日志、不在页面展示
+- **自填 Key 可选**：老用户想用自己的 Key 仍可在设置页填写；空着也能正常用
+- **每天 0 点清零**：日期按北京时间取 `YYYY-MM-DD`，只查当天 `daily_usage` 行，不需要定时任务
+- **超限先拦截**：直接给中文提示，不调用 DeepSeek API、不扣次数
 
-### 3.3 本地先验证一遍（可选）
+### 3.3 手动开通付费版（9.9/月）
+
+页面不接支付。收到爱发电或微信转账后，在服务器上执行：
 
 ```powershell
-# Windows PowerShell：临时设置环境变量后启动
-$env:APP_PASSWORD="test123"
-streamlit run app.py
+python -c "import db; print(db.set_user_tier_by_username('用户名', 'paid'))"
 ```
 
-- 浏览器打开 `http://localhost:8501`，应先看到"🔒 需要访问密码"
-- 输错 → 提示"密码不正确，请重试"
-- 输对 → 进入主界面，之后刷新不再要求输入
-- 关掉该终端 → 环境变量消失，本地又恢复无密码状态
+取消付费改回 `free` 同理。执行前确保 `DATABASE_URL` 指向线上库；
+也可以直接在数据库里把 `users.tier` 改成 `paid`，用户刷新后生效。
 
 ---
 
@@ -166,13 +166,14 @@ streamlit run app.py
 
 部署完成后逐项确认，全部打勾才算真正可用：
 
-- [ ] 打开网址**先弹密码框**，输入正确密码才能进入
-- [ ] 侧边栏显示 API Key 状态为「已配置」（不是红色警告）
+- [ ] 新注册账号不填 Key 也能直接提问（平台 Key 生效）
+- [ ] 顶部「今日剩余额度」显示真实数字（免费版 5 问 / 3 个文档）
+- [ ] 免费账号第 6 次提问被拦，提示写明明天 0 点恢复与付费版额度
+- [ ] 手动把账号 tier 改成 `paid` 后，刷新可见 50 问 / 50 个文档
 - [ ] 上传一个 PDF → 能解析入库（首次含模型加载，约 1–2 分钟）
 - [ ] 自动生成了「全文摘要」和 3 个推荐问题
 - [ ] 点推荐问题提问 → 回答**逐字流式**输出
 - [ ] 展开「📚 命中原文片段与相似度」能看到原文和百分比
-- [ ] 换浏览器/无痕窗口打开 → 再次要求输入密码（说明密码确实生效）
 
 ---
 
@@ -182,9 +183,8 @@ streamlit run app.py
 | --- | --- | --- |
 | 部署日志卡在下载模型 | HuggingFace 网络慢 | 代码已内置 `hf-mirror` 镜像；仍失败则 Reboot 重试 |
 | `ModuleNotFoundError` | 依赖没装全 | 确认 `requirements.txt` 在仓库根目录；改完点 Reboot |
-| 应用显示「API Key 未配置」 | Secrets 没生效 | 检查 Secrets 的 TOML 拼写（键名必须是 `DEEPSEEK_API_KEY`），Save 后等重启完成 |
-| 密码框不出现 | `APP_PASSWORD` 没配上 | 确认 Secrets 里没有多余空格/中文引号；本地可用 `st.secrets` 调试 |
-| 输对密码仍进不去 | 浏览器缓存旧会话 | 用无痕窗口测试；或点应用菜单 → Clear cache |
+| 应用显示「平台 Key 暂未配置」 | Secrets 没生效 | 检查 Secrets 的 TOML 拼写（键名必须是 `DEEPSEEK_API_KEY`），确认是官方 Key，Save 后等重启完成 |
+| 新账号提问被额度拦 | 免费版额度用完 | 免费版每天 5 问；第二天北京时间 0 点恢复，或联系管理员开通 9.9/月付费版 |
 | 容器重启后文档没了 | 云端无持久磁盘 | 已知限制，重启后需重新上传 PDF（见 README 云端注意事项表） |
 | 内存超限被杀（OOM） | 免费版约 1GB | 一次不要上传过多/过大的 PDF；可改用 `bge-small` 已是最省方案 |
 | 应用长时间无人访问后打不开 | 免费版会休眠 | 打开时会自动唤醒，等 1–2 分钟即可 |
@@ -236,12 +236,13 @@ torch>=2.0 ; sys_platform != "linux"            # 本地 Windows/macOS 不受影
 
 ---
 
-## 七、本次为部署所做的代码改动（两处，都在 `app.py`）
+## 七、与平台 Key / 额度相关的代码改动
 
 1. **`_sync_secrets_to_env()`** —— 云端适配。Streamlit Cloud 的 Secrets 不保证自动进入 `os.environ`，而 `qa.py` 是用 `os.getenv()` 读 Key 的。显式同步一次，保证「本地 `.env`」和「云端 Secrets」走同一套读取逻辑。
-2. **`check_password()` / `_get_access_password()`** —— 访问密码。按上述优先级读密码，未配置则自动跳过；通过 `st.session_state` 记住登录状态，用 `st.stop()` 拦截未授权访问。
+2. **`auth.get_platform_api_key()` / `_current_api_key()`** —— 平台 Key 读取与用户自填 Key 覆盖；两者都没有时才给中文提示。
+3. **`quota.py` + `daily_usage` 表** —— free/paid 每日额度、文档总数与调用前拦截；日期按北京时间查当天行，0 点自动重置。
 
-配套改动：`.gitignore` 增加 `.streamlit/secrets.toml`、`.pytest_cache/`；`.env.example` 增加 `APP_PASSWORD` 注释行。
+配套改动：`.gitignore` 增加 `.streamlit/secrets.toml`、`.pytest_cache/`；`.env.example` 增加 `DEEPSEEK_API_KEY` 注释行。
 
 ---
 
@@ -250,4 +251,4 @@ torch>=2.0 ; sys_platform != "linux"            # 本地 Windows/macOS 不受影
 - `.env` 已在 `.gitignore` 中，**永远不要**把它提交到任何仓库（尤其是公开仓库）
 - 云端密钥只走 Streamlit Secrets，它加密存储、仅你可见、不会出现在代码里
 - 若 Key 泄露：到 DeepSeek 控制台**立即吊销并重新生成**，然后更新 Secrets
-- 私有仓库 + 密码是双重保护；若之后要开源，请把仓库设为 Public 前再确认一遍 `.env` 从未入库
+- 私有仓库 + 账号登录是双重保护；若之后要开源，请把仓库设为 Public 前再确认一遍 `.env` 从未入库

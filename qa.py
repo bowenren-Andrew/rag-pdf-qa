@@ -187,7 +187,7 @@ class QAFriendlyError(Exception):
 def get_api_key() -> str:
     """
     读取全局兜底 Key（系统环境变量或 .env）。
-    v3 说明：主路径已改为"每位用户用自己的 Key"，此函数仅作为本地开发与单元测试的兼容回退。
+    v3.8 说明：主路径由 app.py 传入平台 Key 或用户自填 Key；此函数仅作本地开发与单元测试的兼容回退。
     """
     return os.environ.get("DEEPSEEK_API_KEY", "").strip()
 
@@ -202,7 +202,8 @@ def _require_client(api_key: str = None) -> OpenAI:
     key = (api_key or "").strip() or get_api_key()
     if not key:
         raise QAFriendlyError(
-            "未检测到 API Key。请到「⚙️ 设置」页填写你自己的 DeepSeek Key 后再提问。"
+            "未检测到 API Key。平台 Key 未配置，且你没有填写自己的 DeepSeek Key；"
+            "请联系管理员或在「⚙️ 设置」页填写。"
         )
     return OpenAI(api_key=key, base_url=BASE_URL, timeout=60)
 

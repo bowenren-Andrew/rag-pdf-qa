@@ -756,8 +756,8 @@ def inject_theme() -> None:
 
 def topbar_html(
     product_name: str = "课程资料问答助手",
-    quota_value: str = "不限",
-    quota_hint: str = "按你的 DeepSeek Key 计费",
+    quota_value: str = "—",
+    quota_hint: str = "免费版每天 5 次提问、可存 3 个文档；付费版 9.9/月",
 ) -> str:
     """返回顶部品牌栏 HTML；所有展示文本都做 HTML 转义。"""
     name = html.escape(str(product_name))
@@ -774,8 +774,8 @@ def topbar_html(
 
 def render_topbar(
     product_name: str = "课程资料问答助手",
-    quota_value: str = "不限",
-    quota_hint: str = "按你的 DeepSeek Key 计费",
+    quota_value: str = "—",
+    quota_hint: str = "免费版每天 5 次提问、可存 3 个文档；付费版 9.9/月",
 ) -> None:
     """渲染登录后的顶部品牌栏。"""
     st.markdown(

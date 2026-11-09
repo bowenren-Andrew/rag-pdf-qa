@@ -326,6 +326,15 @@ def get_user_api_key(user_id: int) -> str:
         return ""  # 解密失败当作未设置处理，界面会引导用户重新填写
 
 
+def get_platform_api_key() -> str:
+    """
+    读取平台方统一的 DeepSeek Key。
+    只从环境变量 / Streamlit Secrets（经 app 同步进环境变量）/ 本地 .env 读取；
+    不写进代码、不写日志、不在页面展示。
+    """
+    return _get_secret("DEEPSEEK_API_KEY")
+
+
 def set_user_api_key(user_id: int, plain: str) -> str:
     """加密保存用户的 API Key，返回掩码形式用于界面回显。"""
     plain = (plain or "").strip()

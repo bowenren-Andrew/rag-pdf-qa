@@ -4,7 +4,7 @@
 
 
 > 上传 PDF，让大模型只依据你的文档回答问题 —— 答案流式输出，并附带命中原文片段与相似度分数。
-> 当前版本：**v3.3**（Streamlit + Supabase Postgres/pgvector + BGE 中文向量模型 + DeepSeek）
+> 当前版本：**v3.8**（Streamlit + Supabase Postgres/pgvector + BGE 中文向量模型 + DeepSeek）
 
 ---
 
@@ -21,7 +21,8 @@
 | 职责单一 | 四个文件各管一件事：解析 / 向量库 / 大模型 / 界面 |
 | 轻量部署 | 单个 Streamlit 应用即可跑通；本地 sqlite 零配置开发，云端 Postgres 一条连接串 |
 | 中文友好 | 全量中文注释；Key 缺失、网络异常、API 报错均给出中文提示，不崩溃 |
-| 密钥安全 | API Key 只从 `.env`/Secrets 读取，用户级 Key 经 Fernet 加密入库，不硬编码 |
+| 密钥安全 | 平台 Key 只从 `.env`/Secrets 读取；用户自填 Key 经 Fernet 加密入库，不硬编码、不写日志、不展示 |
+| 免费额度（v3.8） | 免费版每天 5 问 / 存 3 个文档 / 每天新传 1 个；付费版 9.9/月为 50 问 / 50 个文档 / 每天新传 5 个 |
 | 全面持久化（v3.3） | 文档、片段向量、摘要、会话及其文档绑定全部存数据库，云端重启/休眠后不丢 |
 
 ---
@@ -34,7 +35,9 @@
 - **自动摘要 + 推荐问题**：文档入库后自动生成全文摘要与 3 个推荐问题，点击即可直接提问
 - **账号体系（v3）**：注册 / 登录后才可使用，密码用 PBKDF2 加盐哈希存储，绝不明文
 - **数据隔离（v3）**：知识库与会话都按 `user_id` 隔离，用户之间互相看不到对方的文档与会话
-- **各自的 Key（v3）**：每位用户在「⚙️ 设置」页填写自己的 DeepSeek Key，Fernet 加密入库，界面只显示掩码
+- **平台 Key + 可选自填（v3.8）**：注册后默认使用平台统一 DeepSeek Key，不用再填 Key；老用户仍可在设置页填自己的 Key 覆盖，Fernet 加密入库、界面只显示掩码
+- **每日额度（v3.8）**：免费/付费等级、每日提问/摘要/上传次数与文档总数限制，顶部实时显示剩余；超限中文拦截，不调 API
+- **单文件硬限制（v3.8）**：单个 PDF/PPTX 最多 100 页、20MB，超限直接拒绝并提示按章节拆分
 - **会话管理**：新建 / 加载 / 删除历史会话，每轮问答自动保存到数据库（本地 sqlite 或云端 Postgres）
 - **中文向量检索**：`BAAI/bge-small-zh-v1.5`，检索 query 自动加 BGE 官方指令前缀
 - **三页面结构（v3）**：💬 问答 / 📁 我的文档 / ⚙️ 设置，用 `st.navigation` 组织
@@ -188,7 +191,7 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-v3 只需要配一行 `APP_SECRET_KEY`（用于加密保存每位用户的 DeepSeek Key）：
+v3.8 本地至少需要 `APP_SECRET_KEY`（加密用户自填 Key 用）和平台 `DEEPSEEK_API_KEY`：
 
 ```bash
 # 生成一把随机密钥，把输出粘到 .env 里
@@ -197,12 +200,14 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 
 ```ini
 APP_SECRET_KEY=粘贴上面命令生成的字符串
+DEEPSEEK_API_KEY=sk-你自己的DeepSeek官方Key
 ```
 
 `DATABASE_URL` 本地**可以留空**，程序会自动使用项目下的 sqlite 文件 `app.db`。
 
-> v3 说明：`DEEPSEEK_API_KEY` 与 `APP_PASSWORD` 都已废弃——
-> API Key 改由每位用户在「⚙️ 设置」页填写，门禁改由账号登录取代。
+> v3.8 说明：平台统一使用 `DEEPSEEK_API_KEY`，必须是**你自己的 DeepSeek 官方 Key**
+> （接口地址固定 `https://api.deepseek.com`，模型固定 `deepseek-flash`）；
+> 不要使用同学提供的临时网关域名。用户自填 Key 变成可选覆盖项。
 > 也可以直接用系统环境变量配置（优先级高于 `.env`）。
 
 ### 4. 启动应用
@@ -216,7 +221,7 @@ streamlit run app.py
 ### 5. 开始使用
 
 1. 首次打开是登录页：切到「注册」创建账号（用户名 3–20 位字母/数字/下划线，密码至少 8 位）
-2. 登录后进「⚙️ 设置」页，填入你的 DeepSeek Key（[申请地址](https://platform.deepseek.com/)），加密保存
+2. 登录后直接可用：默认走平台 Key，**不需要填写任何 Key**；老用户想用自己的 Key 可在「⚙️ 设置」页选填
 3. 进「📁 我的文档」上传一个或多个 PDF → 点「解析并入库」
    （首次会自动从 `hf-mirror` 下载向量模型约 100MB，请耐心等待）
 4. 回「💬 问答」页查看自动摘要与推荐问题，或直接在底部输入框提问；
@@ -244,16 +249,18 @@ git add . && git commit -m "feat: RAG PDF QA v2" && git push
 
 ### 3. 配置 Secrets（关键）
 
-在应用页面 → **Settings → Secrets** 填入（TOML 格式），两个变量都必填：
+在应用页面 → **Settings → Secrets** 填入（TOML 格式），三个变量都必填：
 
 ```toml
 DATABASE_URL = "postgresql://postgres.xxxx:你的密码@aws-0-xxx.pooler.supabase.com:5432/postgres"
 APP_SECRET_KEY = "你的Fernet密钥"
+DEEPSEEK_API_KEY = "sk-你自己的DeepSeek官方Key"
 ```
 
-保存后应用会自动重启。这两个变量的详细获取步骤见「七、云端部署需要配置的 Secrets」。
+保存后应用会自动重启。这三个变量的详细获取步骤见「八、云端部署需要配置的 Secrets」。
 
-> v3 起**不再需要** `DEEPSEEK_API_KEY`（改由用户自己填写）和 `APP_PASSWORD`（改由登录体系取代）。
+> v3.8 起平台统一使用 `DEEPSEEK_API_KEY`（官方 `api.deepseek.com`，模型 `deepseek-flash`）；
+> `APP_PASSWORD` 已废弃，门禁改由账号登录取代。
 
 ### 4. 等待首次构建
 
@@ -265,7 +272,7 @@ APP_SECRET_KEY = "你的Fernet密钥"
 | 事项 | 说明 |
 | --- | --- |
 | 知识库**持久**（v3.3） | 文档片段与向量存在 Supabase Postgres（pgvector），容器重启/休眠唤醒后**无需重新上传** |
-| 原始文件 | ≤20MB 的原始文件字节随文档入库；更大的文件只持久化片段与摘要 |
+| 原始文件 | 单文件最多 100 页 / 20MB，超限直接拒绝；在限制内的原始文件字节随文档入库 |
 | 会话历史**持久** | 会话及其文档绑定存在 Supabase Postgres 里，容器重启不丢（v3 相比 v2 的本地 JSON 是一大改进） |
 | 资源限制 | 免费版约 1GB 内存；`torch + bge-small-zh-v1.5` 较吃紧，不宜上传超大 PDF（v3.3 移除 Chroma 后内存压力更小） |
 | 密钥安全 | `APP_SECRET_KEY` 与数据库连接串只走 Secrets，不要把 `.env` 提交到仓库 |
@@ -274,12 +281,13 @@ APP_SECRET_KEY = "你的Fernet密钥"
 
 ## 八、云端部署需要配置的 Secrets
 
-v3 需要两个环境变量，缺一个应用就起不来：
+v3.8 需要三个环境变量，缺一个都会影响使用：
 
 | 变量 | 作用 | 获取方式 |
 | --- | --- | --- |
-| `DATABASE_URL` | 存用户账号、加密后的 Key 和会话记录 | Supabase 项目的 Postgres 连接串（见下方步骤） |
+| `DATABASE_URL` | 存用户账号、每日用量、加密后的 Key、文档与会话记录 | Supabase 项目的 Postgres 连接串（见下方步骤） |
 | `APP_SECRET_KEY` | 用 Fernet 加密每位用户的 API Key | 本地执行 `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` |
+| `DEEPSEEK_API_KEY` | 平台统一调用的官方 DeepSeek Key（注册后即可用，无需用户自填） | [platform.deepseek.com](https://platform.deepseek.com/) 自行创建；必须是官方 Key，不要用临时网关 |
 
 > ⚠️ `APP_SECRET_KEY` 一旦更换，之前用户保存的 Key 会解密失败，
 > 届时需要请用户到「⚙️ 设置」页重新填写。
@@ -309,11 +317,40 @@ v3 需要两个环境变量，缺一个应用就起不来：
 DATABASE_URL = "postgresql://postgres.xxxx:你的密码@aws-0-ap-southeast-1.pooler.supabase.com:5432/postgres"
 ```
 
-首次部署时程序会自动建 `users` 和 `sessions` 两张表，不需要手工执行 SQL。
+首次部署时程序会自动建 `users`、`sessions`、`documents`、`document_chunks`、`session_documents`、`daily_usage` 等表，不需要手工执行 SQL；老库的 `users` 表会自动补 `tier` 列（默认 `free`）。
 
 > 连接失败排查：确认密码里的特殊字符已 URL 编码（如 `@` 要写成 `%40`）；
 > 若提示 SSL 相关错误，可在连接串末尾加 `?sslmode=require`；
 > 若提示连接数耗尽，检查是否有其他客户端占用了 Supabase 免费版极少的并发连接（本项目已把连接池限制在 8 条以内）。
+
+### 用户额度与人工开通付费（v3.8）
+
+额度定稿（2026-11-09）：
+
+| 项目 | 免费版 `free` | 付费版 `paid`（9.9/月） |
+| --- | --- | --- |
+| 每日提问 | 5 次 | 50 次 |
+| 当前最多存文档 | 3 个（删掉即腾位置） | 50 个 |
+| 每日新传文档 | 1 个 | 5 个 |
+| 每日摘要 | 5 次（防删传来回刷） | 随文档上传生成，日上限 5 次 |
+
+- 用量按**北京时间**日期记在 `daily_usage` 表，同一用户同一天只有一行；查当天行即可实现 0 点清零，不需要定时任务。
+- 提问、生成摘要、上传文档前都会先查额度；超限直接中文提示，不调用 API、不扣次数。
+- 单个文件最多 **100 页 / 20MB**，超限提示「文件过大（超过 100 页或 20MB），请按章节拆分后上传」。
+- 付费先走人工（爱发电 9.9/月或微信转账），页面不接支付。确认收款后手动改 `users.tier`：
+
+```sql
+-- 升级为付费版
+UPDATE users SET tier = 'paid' WHERE username = '用户填的用户名';
+-- 降级回免费版
+UPDATE users SET tier = 'free' WHERE username = '用户填的用户名';
+```
+
+也可以在项目根目录执行：
+
+```bash
+python -c "import db; print(db.set_user_tier_by_username('用户填的用户名', 'paid'))"
+```
 
 ---
 
@@ -327,6 +364,7 @@ pdf_qa_app/
 ├── qa.py                      # DeepSeek 调用（v3：Key 由调用方传入；v3.1：多轮 history）
 ├── auth.py                    # v3 新增：注册登录、密码哈希、Key 加解密与掩码
 ├── db.py                      # v3 新增：SQLAlchemy 数据访问（users / sessions 表）
+├── quota.py                   # v3.8 新增：等级、每日用量与额度拦截（free / paid）
 ├── requirements.txt           # 依赖清单
 ├── .env                       # 本地配置（含 APP_SECRET_KEY，不提交）
 ├── .env.example               # 配置模板
@@ -368,14 +406,17 @@ pytest tests/test_loader.py -v       # 只跑切分相关用例
 pytest tests/test_qa.py -k JSON      # 只跑名字含 JSON 的用例
 ```
 
-当前共 **115 passed / 2 skipped**，覆盖 loader 的文本清洗/切句/重叠切分/硬切兜底、PPTX 解析、OCR 自动兜底与强制 OCR；qa 的 JSON 解析（含代码块围栏、非法 JSON 降级）、错误处理（缺 Key / 401 / 网络失败）、流式输出拼接与多轮历史截断；auth 的密码哈希与 Key 加解密；会话按用户隔离与越权防护。
+当前共 **254 passed / 2 skipped**，覆盖 loader 的文本清洗/切句/重叠切分/硬切兜底、PPTX 解析、OCR 自动兜底与强制 OCR、100 页/20MB 硬限制；qa 的 JSON 解析（含代码块围栏、非法 JSON 降级）、错误处理（缺 Key / 401 / 网络失败）、流式输出拼接与多轮历史截断；auth 的密码哈希与 Key 加解密；会话按用户隔离与越权防护；v3.8 的 free/paid 每日额度、文档总数、上传与摘要次数拦截，以及平台 Key 与老用户自填 Key 的优先级。
 
 > 2 个 skipped 是真实 OCR 引擎的冒烟用例，默认跳过以免加载识别模型；设置环境变量 `RUN_REAL_OCR=1` 后可启用。
 
 ## 十一、常见问题
 
-**Q：提示"未检测到 API Key"？**
-A：确认 `.env` 与 `app.py` 同级、文件名为 `.env`（不是 `.env.txt`）、内容格式为 `DEEPSEEK_API_KEY=sk-xxx`，改完后重启应用。
+**Q：提示"平台 Key 暂未配置"？**
+A：确认 Streamlit Secrets 或 `.env` 里有 `DEEPSEEK_API_KEY=sk-xxx`（必须是 DeepSeek 官方 Key），改完后重启应用；也可以在设置页临时填写自己的 Key。
+
+**Q：提示"今日提问次数已用完"或"文档存储已满"？**
+A：免费版每天 5 问、最多存 3 个文档、每天新传 1 个；删掉不需要的文档可腾出存储位置。用量按北京时间 0 点恢复。付费版 9.9/月（50 问 / 50 个文档 / 每天新传 5 个），联系管理员人工开通。
 
 **Q：PDF 上传后提示"未提取到文本"？**
 A：说明整份文件都没有可用的文本层（纯扫描件），且 OCR 也没识别出来。可确认 `pymupdf` 与

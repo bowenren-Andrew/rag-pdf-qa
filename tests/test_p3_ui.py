@@ -98,13 +98,19 @@ def test_流式失败显示中文错误且不残留思考中(tmp_db, fernet_key)
     assert "估算费用" not in body
 
 
-def test_没有Key时不显示费用(tmp_db, fernet_key):
+def test_没有用户Key时自动使用平台Key(tmp_db, fernet_key, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-platform-test-1234567890")
     at = _open_chat(tmp_db, "p3_no_key", with_key=False)
 
-    _send(at, "没有 Key 的提问")
+    with patch("qa.stream_answer", side_effect=_success_stream), patch(
+        "vectorstore.similarity_search", return_value=[]
+    ):
+        _send(at, "没有自填 Key 的提问")
 
-    assert any("还没有填写 DeepSeek API Key" in w.value for w in at.warning)
-    assert "估算费用" not in _body(at)
+    assert not any("平台 Key 暂未配置" in w.value for w in at.warning)
+    body = _body(at)
+    assert "这是回答" in body
+    assert "估算费用" in body
 
 
 def test_摘要用量在问答页可见(tmp_db, fernet_key):
@@ -126,3 +132,41 @@ def test_首屏加载骨架不会残留(tmp_db, fernet_key):
 
     assert "正在加载课程资料问答助手" not in _body(at)
     assert at.session_state["app_booted"] is True
+
+
+def _capture_answer(captured):
+    def _stream(*args, **kwargs):
+        captured["api_key"] = kwargs.get("api_key")
+        yield "这是回答"
+
+    return _stream
+
+
+def test_老用户自填Key优先于平台Key(tmp_db, fernet_key, monkeypatch):
+    """老用户存过自己的 Key 时继续用他的 Key，平台 Key 只做兜底。"""
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-platform-test-1234567890")
+    at = _open_chat(tmp_db, "p3_legacy_key", with_key=True)
+    captured = {}
+
+    with patch("qa.stream_answer", side_effect=_capture_answer(captured)), patch(
+        "vectorstore.similarity_search", return_value=[]
+    ):
+        _send(at, "老用户用自己的 Key")
+
+    assert captured["api_key"] == "sk-1234567890abcdefghij"
+    assert "这是回答" in _body(at)
+
+
+def test_未自填Key时把平台Key传给模型(tmp_db, fernet_key, monkeypatch):
+    """没填 Key 的新用户走 Streamlit Secrets 里的平台 Key，不需要自备 Key。"""
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-platform-test-1234567890")
+    at = _open_chat(tmp_db, "p3_platform_key", with_key=False)
+    captured = {}
+
+    with patch("qa.stream_answer", side_effect=_capture_answer(captured)), patch(
+        "vectorstore.similarity_search", return_value=[]
+    ):
+        _send(at, "新用户直接用平台 Key")
+
+    assert captured["api_key"] == "sk-platform-test-1234567890"
+    assert "这是回答" in _body(at)

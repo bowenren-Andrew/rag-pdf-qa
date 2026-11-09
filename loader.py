@@ -33,6 +33,11 @@ OCR_ZOOM = 2.0
 # 目前支持的文件后缀（小写）
 SUPPORTED_EXTS = ("pdf", "pptx")
 
+# 单文件硬限制（v3.8）：超过直接中文拒绝，不解析、不扣额度。
+MAX_FILE_PAGES = 100
+MAX_FILE_BYTES = 20 * 1024 * 1024
+MSG_FILE_TOO_LARGE = "文件过大（超过 100 页或 20MB），请按章节拆分后上传"
+
 # 面向用户的中文错误文案：底层异常原文只写日志，不展示给用户
 MSG_EMPTY_FILE = "文件为空，请重新上传。"
 MSG_BROKEN_PDF = "文件已损坏或不是有效的 PDF，请重新上传。"
@@ -458,6 +463,64 @@ def load_and_split_pptx(file: Union[str, IO[bytes]], on_progress=None) -> list[d
                 results.append({"text": chunk, "page": slide_no})
         _notify_progress(on_progress, "extract", slide_no, total_slides)
     return results
+
+
+def _file_size_bytes(file, size_bytes: int = None) -> int:
+    """取文件字节数：优先用调用方给的 size，其次文件对象自带 size，最后才读一遍。"""
+    if size_bytes is not None:
+        return int(size_bytes)
+    declared = getattr(file, "size", None)
+    if isinstance(declared, int) and declared >= 0:
+        return declared
+    if isinstance(file, (str, bytes, os.PathLike)):
+        try:
+            return os.path.getsize(os.fspath(file))
+        except Exception:
+            pass
+    try:
+        return len(_read_file_bytes(file))
+    except Exception:
+        return 0
+
+
+def count_file_pages(file: Union[str, IO[bytes]], filename: str) -> int | None:
+    """
+    只读取页数/幻灯片数，不做文本提取与 OCR。
+    解析失败返回 None，交给真正的解析函数给出对应的中文错误，避免这里误报。
+    """
+    ext = os.path.splitext(filename or "")[1].lower().lstrip(".")
+    try:
+        data = _read_file_bytes(file)
+        if ext == "pdf":
+            reader = PdfReader(io.BytesIO(data))
+            return len(reader.pages)
+        if ext == "pptx":
+            from pptx import Presentation
+
+            return len(Presentation(io.BytesIO(data)).slides)
+    except Exception:
+        logger.debug("提前读取《%s》页数失败", filename, exc_info=True)
+    return None
+
+
+def check_file_limits(
+    file: Union[str, IO[bytes]], filename: str, size_bytes: int = None
+) -> dict:
+    """
+    上传前检查单文件硬限制：最多 100 页（PPTX 为 100 张）、20MB。
+    超限直接抛 FileParseError（中文提示），不解析、不写库、不扣额度。
+    :return: {"size": 字节数, "pages": 页数或 None}
+    """
+    ext = os.path.splitext(filename or "")[1].lower().lstrip(".")
+    size = _file_size_bytes(file, size_bytes)
+    if ext in SUPPORTED_EXTS:
+        if size > MAX_FILE_BYTES:
+            raise FileParseError(MSG_FILE_TOO_LARGE)
+        pages = count_file_pages(file, filename)
+        if pages is not None and pages > MAX_FILE_PAGES:
+            raise FileParseError(MSG_FILE_TOO_LARGE)
+        return {"size": size, "pages": pages}
+    return {"size": size, "pages": None}
 
 
 def load_and_split_file(

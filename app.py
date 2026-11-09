@@ -18,6 +18,9 @@ app.py（v3.7 外观改版）
           展示实际调用模型、每轮 token 用量与估算费用（问答与摘要）。
 - v3.7 变更（仅外观）：浅色学习风主题、900px 居中阅读区、顶部品牌栏、
           上传虚线卡片、左右对话气泡、摘要卡与引用出处 pill；业务逻辑与接口不变。
+- v3.8 变更（平台 Key + 额度）：注册后默认使用 Secrets 里的平台官方 Key，
+           用户自填 Key 变为可选覆盖；新增 free/paid 每日额度与 topbar 真实剩余；
+           上传前拦截超 100 页 / 20MB 的单文件。
 - 页面结构（st.navigation 多页面）：
   1) 💬 问答      —— 聊天、流式回答、引用原文与相似度、文档摘要与推荐问题、会话管理
   2) 📁 我的文档  —— 上传 PDF / PPTX 入库（查重、存库）、已入库列表与删除
@@ -76,7 +79,7 @@ def _sync_secrets_to_env():
     保证「本地 .env」和「云端 Secrets」两种部署方式走同一套读取逻辑。
     """
     try:
-        for key in ("DATABASE_URL", "APP_SECRET_KEY"):
+        for key in ("DATABASE_URL", "APP_SECRET_KEY", "DEEPSEEK_API_KEY"):
             if not os.environ.get(key):  # 已存在的环境变量不覆盖
                 value = st.secrets.get(key, "")
                 if value:
@@ -91,7 +94,13 @@ _sync_secrets_to_env()
 # noqa 注释是刻意保留的：这里不能把这些 import 提到文件顶部。
 import auth  # noqa: E402
 import db  # noqa: E402
-from loader import FileParseError, load_and_split_file, repair_chunk_text  # noqa: E402
+import quota  # noqa: E402
+from loader import (  # noqa: E402
+    FileParseError,
+    check_file_limits,
+    load_and_split_file,
+    repair_chunk_text,
+)
 from qa import (  # noqa: E402
     MODEL,
     QAFriendlyError,
@@ -289,7 +298,26 @@ if st.session_state.user is None:
 render_sidebar_user()
 
 USER_ID = st.session_state.user["id"]
-render_topbar()
+# 每次都从库里读一次等级，管理员手动改成 paid 后无需重新登录即可生效。
+USER = db.get_user_by_id(USER_ID) or st.session_state.user
+TIER = quota.normalize_tier(USER.get("tier"))
+
+# 顶栏先渲染一次，页面执行完再按最新用量刷新：提问成功后的 rerun 与
+# 上传入库这类不触发 rerun 的操作，都能让顶栏数字及时减少。
+_quota_topbar_slot = st.empty()
+
+
+def _refresh_quota_topbar() -> None:
+    tier = quota.normalize_tier((db.get_user_by_id(USER_ID) or USER).get("tier"))
+    snap = quota.snapshot(USER_ID, tier)
+    with _quota_topbar_slot:
+        render_topbar(
+            quota_value=quota.topbar_text(snap),
+            quota_hint=quota.topbar_hint(snap),
+        )
+
+
+_refresh_quota_topbar()
 
 
 def _drop_doc_from_session_state(doc_id: int, name: str):
@@ -375,8 +403,8 @@ def _confirm_delete_session():
         st.rerun()
 
 
-def _current_api_key() -> str:
-    """读取当前用户解密后的 DeepSeek Key；未设置返回空字符串。"""
+def _saved_user_api_key() -> str:
+    """当前用户自填并加密保存的 Key；未设置返回空字符串（设置页展示用）。"""
     try:
         return auth.get_user_api_key(USER_ID)
     except auth.AuthFriendlyError as e:
@@ -384,13 +412,22 @@ def _current_api_key() -> str:
         return ""
 
 
+def _current_api_key() -> str:
+    """
+    实际调用使用的 Key：优先用户自填的 Key（老用户想用自己的 Key），
+    空着则回退到平台统一 Key。平台 Key 只从 Secrets/env 读取，不落日志、不展示。
+    """
+    return _saved_user_api_key() or auth.get_platform_api_key()
+
+
 def _require_key_or_guide() -> str:
-    """
-    取当前用户的 Key；没填时给出引导提示并返回空字符串（不抛异常、不崩溃）。
-    """
+    """取实际可用的 Key；平台未配置且用户也没填时才提示，不抛异常。"""
     key = _current_api_key()
     if not key:
-        st.warning("还没有填写 DeepSeek API Key，请到「⚙️ 设置」页填写后再使用提问功能。")
+        st.warning(
+            "平台 Key 暂未配置，请联系管理员；你也可以到「⚙️ 设置」页填写自己的 "
+            "DeepSeek Key 后继续使用。"
+        )
     return key
 
 
@@ -747,6 +784,13 @@ def _build_history() -> list[dict]:
 
 def handle_question(question: str) -> bool:
     """处理一次提问：取用户 Key → 检索 → 带历史流式生成 → 展示来源 → 自动保存会话。"""
+    # 调用前先查当天额度：超限直接中文拦截，不创建会话、不调 API、不记用量。
+    snap = quota.snapshot(USER_ID, TIER)
+    allowed, quota_msg = quota.check_question(snap)
+    if not allowed:
+        st.warning(quota_msg)
+        return False
+
     api_key = _require_key_or_guide()
     if not api_key:
         return False
@@ -778,6 +822,8 @@ def handle_question(question: str) -> bool:
                 USER_ID, question, top_k=4, sources=scope or None
             )
             thinking.markdown("⏳ **思考中…** 已找到相关资料，正在生成回答…")
+            # 真正发起模型调用前记 1 次；被上面拦截的请求不会走到这里。
+            quota.record_question(USER_ID)
             # write_stream 会逐段消费生成器，实现打字机效果；
             # reveal_on_first_chunk 保证首个 chunk 到达即清掉占位、异常时也不残留。
             answer = st.write_stream(
@@ -878,15 +924,30 @@ def page_documents():
             )
 
     if uploaded_files and parse_clicked:
-        api_key = _current_api_key()  # 摘要生成需要 Key，没有则跳过摘要
+        api_key = _current_api_key()  # 平台 Key 兜底；没有则只入库、不生成摘要
         for f in uploaded_files:
             if os.path.splitext(f.name)[1].lower() not in (".pdf", ".pptx"):
                 st.warning(f"《{escape_markdown(f.name)}》格式不支持，仅支持 PDF 与 PPTX，已跳过。")
                 continue
+            if document_exists(USER_ID, f.name):
+                st.info(f"《{escape_markdown(f.name)}》已入库，跳过。如需重新处理，请先删除它。")
+                continue
+
+            # 单文件硬限制：先读大小与页数，超限直接中文拒绝，不解析、不扣额度。
+            try:
+                check_file_limits(f, f.name, size_bytes=getattr(f, "size", None))
+            except FileParseError as e:
+                st.error(f"《{escape_markdown(f.name)}》{e}")
+                continue
+
+            # 调用前查额度：文档总数与今日新传次数；超限不解析、不写库。
+            snap = quota.snapshot(USER_ID, TIER)
+            allowed, quota_msg = quota.check_upload(snap)
+            if not allowed:
+                st.warning(quota_msg)
+                continue
+
             with _parse_progress(f.name) as (progress_bar, on_progress):
-                if document_exists(USER_ID, f.name):
-                    st.info(f"《{escape_markdown(f.name)}》已入库，跳过。如需重新处理，请先删除它。")
-                    continue
                 try:
                     # 按后缀分发解析；OCR 情况写进 report，供下方提示使用
                     ocr_report = {}
@@ -943,6 +1004,8 @@ def page_documents():
                     if n == 0:
                         st.info(f"《{escape_markdown(f.name)}》已入库，跳过。如需重新处理，请先删除它。")
                         continue
+                    # 只有真正新增文档才计入「今日新传次数」。
+                    quota.record_upload(USER_ID)
                     st.success(f"《{escape_markdown(f.name)}》入库完成：{n} 个片段（已持久化，重启不丢失）")
                 except Exception:
                     logger.exception("《%s》入库失败", f.name)
@@ -958,7 +1021,16 @@ def page_documents():
                 # 入库后自动生成全文摘要 + 3 个推荐问题（只在该文档内检索），
                 # 生成结果持久化到文档上，随会话/文档恢复
                 if not api_key:
-                    st.info(f"《{escape_markdown(f.name)}》已入库；填写 API Key 后可自动生成摘要与推荐问题。")
+                    st.info(
+                        f"《{escape_markdown(f.name)}》已入库；平台 Key 未配置且你没有填写自己的 Key，"
+                        "本次未生成摘要与推荐问题。"
+                    )
+                    continue
+                # 摘要前查当天次数（免费版 5 次，防删传来回刷）；超限只跳过摘要。
+                snap = quota.snapshot(USER_ID, TIER)
+                allowed, quota_msg = quota.check_summary(snap)
+                if not allowed:
+                    st.warning(quota_msg)
                     continue
                 progress_bar.progress(0.99, text="正在生成摘要与推荐问题…")
                 try:
@@ -969,6 +1041,7 @@ def page_documents():
                         source=f.name,
                     )
                     usage = {}
+                    quota.record_summary(USER_ID)
                     brief = generate_doc_brief(
                         f.name, ctx, api_key=api_key, usage_out=usage
                     )
@@ -1064,13 +1137,21 @@ def page_settings():
             "用户名", value=st.session_state.user["username"], disabled=True
         )
         info_cols[1].text_input("注册时间", value=created_str, disabled=True)
+        st.caption(
+            f"当前套餐：{quota.TIER_LABELS[TIER]}。付费版 9.9/月，"
+            "开通请通过爱发电或微信转账联系管理员，确认收款后手动开通，页面不接支付。"
+        )
 
     with st.container(border=True, key="settings_key"):
-        st.markdown("**DeepSeek API Key**")
-        current_key = _current_api_key()
-        st.code(auth.mask_key(current_key), language=None)
+        st.markdown("**DeepSeek API Key（可选）**")
+        saved_key = _saved_user_api_key()
+        st.code(
+            auth.mask_key(saved_key) if saved_key else "未设置（正在使用平台 Key）",
+            language=None,
+        )
         st.caption(
-            "Key 使用 Fernet 加密后保存，只有你自己能用。"
+            "默认使用平台统一 Key，空着也能正常提问和生成摘要。"
+            "你也可以填自己的 Key 覆盖平台 Key（老用户兼容）；自填 Key 使用 Fernet 加密保存，只有你自己能用。"
             "申请地址：[platform.deepseek.com](https://platform.deepseek.com/)"
         )
 
@@ -1096,7 +1177,7 @@ def page_settings():
                 "填入新的 Key",
                 type="password",
                 placeholder="sk-...",
-                help="保存后会覆盖旧 Key",
+                help="可选；保存后会覆盖旧 Key，不填则继续使用平台 Key",
                 key=api_key_widget_key,
             )
             saved = st.form_submit_button("保存 Key", type="primary")
@@ -1116,10 +1197,10 @@ def page_settings():
             except (auth.AuthFriendlyError, QAFriendlyError) as e:
                 st.error(str(e))
 
-        if current_key and st.button("删除已保存的 Key", key="delete_key_btn"):
+        if saved_key and st.button("删除已保存的 Key", key="delete_key_btn"):
             auth.delete_user_api_key(USER_ID)
             st.session_state["_reset_api_key_input"] = True
-            st.success("已删除保存的 Key，需要时可重新填写。")
+            st.success("已删除保存的 Key，后续将使用平台 Key。")
             st.rerun()
 
     with st.container(border=True, key="settings_password"):
@@ -1151,3 +1232,5 @@ PAGES = [
 ]
 navigation = st.navigation(PAGES)
 navigation.run()
+# 页面里可能刚用掉额度（提问、上传），结束时再渲染一次，确保顶栏数字准确。
+_refresh_quota_topbar()

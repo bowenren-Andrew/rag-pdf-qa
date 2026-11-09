@@ -1,6 +1,7 @@
 # -*- coding: utf-8 -*-
 """提问输入上限（BUG-08）的界面级测试。"""
 import os
+from unittest.mock import patch
 
 from streamlit.testing.v1 import AppTest
 
@@ -54,12 +55,17 @@ def test_超过2000字被提示并禁止提交(tmp_db):
     assert not any("还没有填写 DeepSeek API Key" in w.value for w in at.warning)
 
 
-def test_2000字以内可进入提交流程(tmp_db):
-    """恰好 2000 字应通过长度校验（没有 Key 时由既有 Key 引导拦截）。"""
+def test_2000字以内可进入提交流程(tmp_db, monkeypatch):
+    """恰好 2000 字应通过长度校验；没有自填 Key 时走平台 Key。"""
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-platform-test-1234567890")
     at = _open_chat(tmp_db, "question_ok")
 
     at.text_area[0].set_value("x" * 2000).run()
-    next(b for b in at.button if b.label == "发送").click().run()
+    with patch("qa.stream_answer", return_value=iter(["平台 Key 回答"])), patch(
+        "vectorstore.similarity_search", return_value=[]
+    ):
+        next(b for b in at.button if b.label == "发送").click().run()
 
     assert not any("不能超过 2000 字" in w.value for w in at.warning)
-    assert any("还没有填写 DeepSeek API Key" in w.value for w in at.warning)
+    assert not any("平台 Key 暂未配置" in w.value for w in at.warning)
+    assert any("平台 Key 回答" in m.value for m in at.markdown)

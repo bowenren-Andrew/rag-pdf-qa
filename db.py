@@ -24,10 +24,13 @@ from sqlalchemy import (
     LargeBinary,
     String,
     Text,
+    UniqueConstraint,
     bindparam,
     create_engine,
+    inspect,
     text,
 )
+from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy.types import UserDefinedType
 
@@ -97,7 +100,33 @@ def set_database_url(url: str):
 def init_db():
     """建表（已存在则跳过），应用启动时调用一次。Postgres 下还会尝试启用 pgvector。"""
     Base.metadata.create_all(get_engine())
+    _migrate_schema()
     _ensure_pgvector()
+
+
+def _migrate_schema():
+    """
+    轻量向后兼容迁移（只做 additive 变更，不改已有列）。
+    v3.8：老库的 users 表没有 tier 列，补一列并默认 free；
+    daily_usage 是新车表，由 create_all 负责创建。
+    """
+    try:
+        inspector = inspect(get_engine())
+        if "users" not in inspector.get_table_names():
+            return
+        columns = {c["name"] for c in inspector.get_columns("users")}
+        if "tier" in columns:
+            return
+        with get_engine().begin() as conn:
+            conn.exec_driver_sql(
+                "ALTER TABLE users ADD COLUMN tier VARCHAR(16) NOT NULL DEFAULT 'free'"
+            )
+    except Exception:
+        # 迁移失败不应阻断应用启动；新库本身已包含 tier 列。
+        # 不记录数据库连接串等敏感信息。
+        import logging
+
+        logging.getLogger(__name__).exception("users.tier 字段迁移失败")
 
 
 # pgvector 是否可用的缓存结果：True / False / None（还没探测过）
@@ -159,7 +188,29 @@ class User(Base):
     username = Column(String(32), unique=True, nullable=False, index=True)
     password_hash = Column(String(255), nullable=False)  # pbkdf2_sha256$迭代次数$盐$哈希
     api_key_enc = Column(Text, nullable=True)  # Fernet 加密后的 DeepSeek Key
+    tier = Column(String(16), nullable=False, default="free", server_default="free")
     created_at = Column(DateTime, nullable=False, default=datetime.now)
+
+
+class DailyUsage(Base):
+    """
+    每日用量表（v3.8 新增）：同一用户同一天只有一行。
+    日期存北京时间的 YYYY-MM-DD 字符串；查当天行即可实现「每天 0 点清零」，
+    不需要定时任务，也不回写历史行。
+    """
+
+    __tablename__ = "daily_usage"
+    __table_args__ = (
+        UniqueConstraint("user_id", "usage_date", name="uq_daily_usage_user_date"),
+    )
+
+    id = Column(Integer, primary_key=True)
+    user_id = Column(Integer, ForeignKey("users.id"), nullable=False, index=True)
+    usage_date = Column(String(10), nullable=False, index=True)
+    question_count = Column(Integer, nullable=False, default=0)
+    summary_count = Column(Integer, nullable=False, default=0)
+    upload_count = Column(Integer, nullable=False, default=0)
+    updated_at = Column(DateTime, nullable=False, default=datetime.now)
 
 
 class ChatSession(Base):
@@ -294,6 +345,26 @@ def update_api_key_enc(user_id: int, api_key_enc: str | None):
         )
 
 
+def set_user_tier(user_id: int, tier: str) -> bool:
+    """
+    手动设置用户等级（free / paid）。
+    付费开通先走人工：管理员确认收款后调用本函数或直接改 users.tier。
+    """
+    if tier not in ("free", "paid"):
+        raise ValueError("tier 只能是 free 或 paid")
+    with session_scope() as db:
+        rows = db.query(User).filter(User.id == user_id).update({"tier": tier})
+        return rows > 0
+
+
+def set_user_tier_by_username(username: str, tier: str) -> bool:
+    """按用户名手动设置等级，方便管理员在后台操作。"""
+    user = get_user_by_username((username or "").strip())
+    if user is None:
+        return False
+    return set_user_tier(user["id"], tier)
+
+
 def _user_to_dict(user: User) -> dict:
     """ORM 对象转普通 dict，避免会话关闭后再访问属性报错。"""
     return {
@@ -301,8 +372,85 @@ def _user_to_dict(user: User) -> dict:
         "username": user.username,
         "password_hash": user.password_hash,
         "api_key_enc": user.api_key_enc,
+        "tier": user.tier or "free",
         "created_at": user.created_at,
     }
+
+
+# ---------------- 每日用量（v3.8 新增） ----------------
+_USAGE_FIELDS = {
+    "question": "question_count",
+    "summary": "summary_count",
+    "upload": "upload_count",
+}
+
+
+def get_daily_usage(user_id: int, usage_date: str) -> dict:
+    """
+    读取某用户某天的用量；当天还没有任何操作时返回全 0。
+    按日期查行即可实现「每天 0 点清零」，不需要定时任务。
+    """
+    with session_scope() as db:
+        row = (
+            db.query(DailyUsage)
+            .filter(
+                DailyUsage.user_id == user_id,
+                DailyUsage.usage_date == usage_date,
+            )
+            .one_or_none()
+        )
+        if row is None:
+            return {
+                "date": usage_date,
+                "question_count": 0,
+                "summary_count": 0,
+                "upload_count": 0,
+            }
+        return {
+            "date": row.usage_date,
+            "question_count": row.question_count,
+            "summary_count": row.summary_count,
+            "upload_count": row.upload_count,
+        }
+
+
+def increment_daily_usage(
+    user_id: int, usage_date: str, kind: str, amount: int = 1
+) -> dict:
+    """
+    给某用户某天的某项用量加一（并返回最新用量）。
+    :param kind: question / summary / upload
+    并发下首次建行可能撞唯一约束，捕获后重试一次更新。
+    """
+    field = _USAGE_FIELDS.get(kind)
+    if field is None:
+        raise ValueError("kind 只能是 question / summary / upload")
+    if amount < 1:
+        raise ValueError("amount 必须为正整数")
+
+    def _apply():
+        with session_scope() as db:
+            row = (
+                db.query(DailyUsage)
+                .filter(
+                    DailyUsage.user_id == user_id,
+                    DailyUsage.usage_date == usage_date,
+                )
+                .one_or_none()
+            )
+            if row is None:
+                row = DailyUsage(user_id=user_id, usage_date=usage_date)
+                db.add(row)
+                db.flush()
+            setattr(row, field, int(getattr(row, field) or 0) + amount)
+            row.updated_at = datetime.now()
+
+    try:
+        _apply()
+    except IntegrityError:
+        # 另一个请求刚好插入了当天行：回滚后按更新路径重试一次。
+        _apply()
+    return get_daily_usage(user_id, usage_date)
 
 
 # ---------------- 会话读写（全部强制带 user_id） ----------------
@@ -507,6 +655,12 @@ def list_user_documents(user_id: int) -> list[dict]:
             .all()
         )
         return [_document_row_to_dict(r) for r in rows]
+
+
+def count_user_documents(user_id: int) -> int:
+    """当前用户已存文档总数（免费/付费的「总共最多存几个」按这个数算）。"""
+    with session_scope() as db:
+        return db.query(Document.id).filter(Document.user_id == user_id).count()
 
 
 def set_document_summary(user_id: int, document_id: int, brief: dict) -> bool:
