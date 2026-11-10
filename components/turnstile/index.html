@@ -4,16 +4,25 @@
     <meta charset="utf-8" />
     <style>
       html, body { margin: 0; padding: 0; background: transparent; font-family: sans-serif; }
-      #turnstile { min-height: 66px; }
+      #turnstile-widget { min-height: 66px; }
       #status { font-size: 12px; color: #6b7280; margin-top: 4px; }
     </style>
   </head>
   <body>
-    <div id="turnstile"></div>
+    <!-- 容器 id 不能叫 turnstile：浏览器会把带 id 的元素暴露成 window.turnstile，
+         遮蔽 Cloudflare 的全局 API，导致 window.turnstile.render 不存在。 -->
+    <div id="turnstile-widget"></div>
     <div id="status">正在加载人机验证…</div>
     <script>
+      const WIDGET_SELECTOR = "#turnstile-widget";
+      const API_SRC = "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit";
+      const LOAD_TIMEOUT_MS = 15000;
+
       let widgetId = null;
       let pendingSitekey = "";
+      let loading = false;
+      let loadCallbacks = [];
+      let loadTimer = null;
 
       function post(type, payload) {
         window.parent.postMessage(
@@ -33,19 +42,44 @@
         setFrameHeight();
       }
 
+      function apiReady() {
+        return !!(window.turnstile && typeof window.turnstile.render === "function");
+      }
+
+      function flushCallbacks() {
+        loading = false;
+        if (loadTimer) {
+          clearTimeout(loadTimer);
+          loadTimer = null;
+        }
+        const callbacks = loadCallbacks;
+        loadCallbacks = [];
+        if (!apiReady()) {
+          setStatus("人机验证加载失败，请刷新页面重试。");
+          return;
+        }
+        callbacks.forEach(function (callback) {
+          callback();
+        });
+      }
+
       function loadTurnstile(callback) {
-        if (window.turnstile) {
+        if (apiReady()) {
           callback();
           return;
         }
+        loadCallbacks.push(callback);
+        if (loading) {
+          return;
+        }
+        loading = true;
         const script = document.createElement("script");
-        script.src = "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit";
+        script.src = API_SRC;
         script.async = true;
         script.defer = true;
-        script.onload = callback;
-        script.onerror = function () {
-          setStatus("人机验证加载失败，请刷新页面重试。");
-        };
+        script.onload = flushCallbacks;
+        script.onerror = flushCallbacks;
+        loadTimer = setTimeout(flushCallbacks, LOAD_TIMEOUT_MS);
         document.head.appendChild(script);
       }
 
@@ -55,32 +89,48 @@
         }
         pendingSitekey = sitekey;
         loadTurnstile(function () {
-          widgetId = window.turnstile.render("#turnstile", {
-            sitekey: sitekey,
-            theme: "light",
-            callback: function (token) {
-              setStatus("人机验证已完成。");
-              post("streamlit:setComponentValue", {
-                value: token,
-                dataType: "json",
-              });
-            },
-            "expired-callback": function () {
-              setStatus("人机验证已过期，请重新验证。");
-              post("streamlit:setComponentValue", {
-                value: "",
-                dataType: "json",
-              });
-            },
-            "error-callback": function () {
-              setStatus("人机验证失败，请重试。");
-              post("streamlit:setComponentValue", {
-                value: "",
-                dataType: "json",
-              });
-            },
-          });
-          setStatus("请完成人机验证。");
+          // Streamlit 首次挂载可能连发多条 render 消息；脚本加载完成后统一回调，
+          // 这里必须再判一次，否则同一个容器会被 render 两次。
+          if (widgetId !== null) {
+            return;
+          }
+          try {
+            widgetId = window.turnstile.render(WIDGET_SELECTOR, {
+              sitekey: sitekey,
+              theme: "light",
+              callback: function (token) {
+                setStatus("人机验证已完成。");
+                post("streamlit:setComponentValue", {
+                  value: token,
+                  dataType: "json",
+                });
+              },
+              "expired-callback": function () {
+                setStatus("人机验证已过期，请重新验证。");
+                post("streamlit:setComponentValue", {
+                  value: "",
+                  dataType: "json",
+                });
+              },
+              "error-callback": function (code) {
+                setStatus("人机验证失败，请重试。");
+                post("streamlit:setComponentValue", {
+                  value: "",
+                  dataType: "json",
+                });
+                if (window.console) {
+                  window.console.error("Turnstile error", code);
+                }
+              },
+            });
+            setStatus("请完成人机验证。");
+          } catch (err) {
+            widgetId = null;
+            setStatus("人机验证加载失败，请刷新页面重试。");
+            if (window.console) {
+              window.console.error("Turnstile render failed", err);
+            }
+          }
         });
       }
 
