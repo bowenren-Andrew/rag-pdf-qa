@@ -148,8 +148,8 @@ def validate_password(password: str) -> tuple[bool, str]:
 
 
 def normalize_email(email: str) -> str:
-    """邮箱统一小写并去空格；入库、查重、验证码都用同一形式。"""
-    return (email or "").strip().lower()
+    """邮箱统一小写、去首尾空白与零宽字符；入库、查重、验证码、登录都用同一形式。"""
+    return db.canonical_email(email)
 
 
 def validate_email(email: str) -> tuple[bool, str]:
@@ -358,7 +358,8 @@ def register(
 def login(username: str, password: str) -> dict | None:
     """
     登录校验，支持用户名或完整邮箱地址。
-    先按用户名查，查不到再按邮箱查（邮箱统一小写后比对）。
+    先按用户名查，查不到再按邮箱查（邮箱大小写、首尾空白都不敏感，
+    由 db.get_user_by_email 统一归一后比对）。
     失败统一返回 None —— 不区分"账号不存在"与"密码错误"，
     避免攻击者据此枚举账号。
     """

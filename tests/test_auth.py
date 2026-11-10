@@ -7,7 +7,11 @@ auth.py 的单元测试（密码哈希 / 平台 Key 读取 / 历史 Key 清理 /
 2. 不依赖真实 .env 里的 DEEPSEEK_API_KEY；
 3. 不发任何网络请求，因此不会调用真实的 DeepSeek API。
 """
+from datetime import datetime
+
 import pytest
+from sqlalchemy import select
+from sqlalchemy.dialects import postgresql, sqlite
 
 import auth
 import db
@@ -139,6 +143,89 @@ def test_未验证邮箱账号用邮箱登录被拦回(tmp_db):
     )
     with pytest.raises(auth.AuthFriendlyError, match="邮箱验证"):
         auth.login("unverified@example.com", "Password123")
+
+
+# ---------------- 邮箱登录：归一化与跨库一致性（回归） ----------------
+def test_邮箱登录遇到库里未规范化的历史数据也能成功(tmp_db):
+    """
+    回归：线上历史行的 email 可能存成混合大小写 / 带首尾空格。
+    原来用精确等号比对（Postgres 区分大小写），这类数据直接查不到；
+    现在按「小写 + 去首尾空白」归一后比对，输入怎么写都能命中。
+    """
+    db.create_user(
+        "legacy_mixed_case",
+        auth.hash_password("LegacyPass123"),
+        email="  BowenRen9@Gmail.com ",
+        email_verified_at=datetime.now(),
+    )
+    for identifier in (
+        "bowenren9@gmail.com",
+        "BowenRen9@Gmail.com",
+        "BOWENREN9@GMAIL.COM",
+        "  bowenren9@gmail.com  ",
+    ):
+        user = auth.login(identifier, "LegacyPass123")
+        assert user is not None, identifier
+        assert user["username"] == "legacy_mixed_case"
+
+
+def test_邮箱里的零宽字符不影响登录(tmp_db):
+    """复制粘贴带进来的零宽字符（U+200B）也应被忽略，否则线上会「看起来一模一样却查不到」。"""
+    db.create_user(
+        "zw_user",
+        auth.hash_password("ZwPass12345"),
+        email="bowenren9@gmail.com\u200b",
+        email_verified_at=datetime.now(),
+    )
+    user = auth.login("bowenren9@gmail.com", "ZwPass12345")
+    assert user is not None
+    assert user["username"] == "zw_user"
+
+
+def test_同邮箱大小写不同时登录不抛异常(tmp_db):
+    """
+    唯一索引区分大小写，库里可能同时存在两条同邮箱账号。
+    归一后可能匹配多行，登录必须稳定取最早一条，不能抛 MultipleResultsFound。
+    """
+    db.create_user(
+        "dup_first",
+        auth.hash_password("FirstPass123"),
+        email="bowenren9@gmail.com",
+        email_verified_at=datetime.now(),
+    )
+    db.create_user(
+        "dup_second",
+        auth.hash_password("SecondPass123"),
+        email="BowenRen9@Gmail.com",
+        email_verified_at=datetime.now(),
+    )
+    user = auth.login("bowenren9@gmail.com", "FirstPass123")
+    assert user is not None
+    assert user["username"] == "dup_first"
+    assert auth.login("bowenren9@gmail.com", "SecondPass123") is None
+
+
+def test_邮箱查询在sqlite与postgres下生成同一语义的sql():
+    """
+    回归：邮箱查询不能用 LIKE/ILIKE。
+    sqlite 的 LIKE 默认大小写不敏感、Postgres 的 LIKE 大小写敏感，
+    同一句代码在两边行为不同；现在两种方言编译出的 SQL 完全一致。
+    """
+    stmt = select(db.User.id).where(
+        db._email_column_key(db.User.email) == "bowenren9@gmail.com"
+    )
+    compiled = {}
+    for name, dialect in (
+        ("postgres", postgresql.dialect()),
+        ("sqlite", sqlite.dialect()),
+    ):
+        sql = str(stmt.compile(dialect=dialect, compile_kwargs={"literal_binds": True}))
+        compiled[name] = " ".join(sql.split())
+        lowered = compiled[name].lower()
+        assert " like " not in lowered
+        assert " ilike " not in lowered
+        assert "lower(trim(" in lowered
+    assert compiled["postgres"] == compiled["sqlite"]
 
 
 def test_用户名重复时给出中文提示(register_verified):

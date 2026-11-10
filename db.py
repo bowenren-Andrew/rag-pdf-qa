@@ -27,6 +27,7 @@ from sqlalchemy import (
     UniqueConstraint,
     bindparam,
     create_engine,
+    func,
     inspect,
     text,
 )
@@ -465,10 +466,44 @@ def create_user(
         return _user_to_dict(user)
 
 
+# 邮箱比对规则：小写 + 去掉首尾空白 + 去掉零宽字符（复制粘贴常见）。
+# SQL 侧刻意不用 LIKE/ILIKE —— sqlite 的 LIKE 默认大小写不敏感、Postgres 的大小写敏感，
+# 同一句代码在两边行为不同；这里显式 lower(trim(...))，两种数据库生成同一语义的 SQL。
+_EMAIL_INVISIBLE_CHARS = "\u200b\u200c\u200d\ufeff"
+_EMAIL_INVISIBLE_MAP = str.maketrans("", "", _EMAIL_INVISIBLE_CHARS)
+
+
+def canonical_email(email: str | None) -> str:
+    """邮箱的规范形式（入库、查重、登录比对都用它），与 _email_column_key 规则一致。"""
+    return (email or "").translate(_EMAIL_INVISIBLE_MAP).strip().lower()
+
+
+def _email_column_key(column):
+    """把邮箱列规范化的 SQL 表达式；sqlite 与 Postgres 通用（不依赖 LIKE）。"""
+    expr = column
+    for invisible in _EMAIL_INVISIBLE_CHARS:
+        expr = func.replace(expr, invisible, "")
+    return func.lower(func.trim(expr))
+
+
 def get_user_by_email(email: str) -> dict | None:
-    """按邮箱查用户；邮箱在入库前已经统一小写。"""
+    """
+    按邮箱查用户；大小写、首尾空白、零宽字符都不敏感。
+    历史数据里可能存着未规范化的邮箱，这里在 SQL 里归一后再比对，保证
+    sqlite（本地）和 Postgres（线上 Supabase）查到的是同一批数据。
+    """
+    key = canonical_email(email)
+    if not key:
+        return None
     with session_scope() as db:
-        user = db.query(User).filter(User.email == email).one_or_none()
+        # 唯一索引区分大小写，库里可能同时存在大小写不同的同邮箱账号；
+        # 用 first() 取最早的一条，避免 one_or_none() 抛 MultipleResultsFound。
+        user = (
+            db.query(User)
+            .filter(_email_column_key(User.email) == key)
+            .order_by(User.id)
+            .first()
+        )
         return _user_to_dict(user) if user else None
 
 
