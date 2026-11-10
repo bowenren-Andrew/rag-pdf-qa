@@ -195,8 +195,8 @@ def render_auth_page():
             unsafe_allow_html=True,
         )
 
-        # 用 radio 代替 tabs：注册成功后可以直接切回登录页并回填用户名。
-        # 切换发生在下一次 rerun、radio 实例化之前，避免直接改 widget state 被忽略。
+        # 用 radio 切换登录/注册。注册成功后直接进入应用；
+        # 退出登录时通过 _switch_to_login 回到登录页（在下一次 radio 实例化前生效）。
         with st.container(border=True, key="auth_card"):
             if st.session_state.pop("_switch_to_login", False):
                 # 在 radio 实例化之前写入值，前后端都会显示「登录」；直接 pop 会让
@@ -231,8 +231,9 @@ def render_login_form():
         )
     with st.form("login_form"):
         username = st.text_input(
-            "用户名",
-            placeholder="3–20 位字母、数字或下划线",
+            "用户名或邮箱",
+            placeholder="输入用户名或注册邮箱",
+            help="用户名 3–20 位字母、数字或下划线；也可以输入注册时使用的完整邮箱地址。",
             key="login_username",
         )
         password = st.text_input("密码", type="password")
@@ -350,9 +351,14 @@ def render_register_form():
             client_ip=request_ip.get_client_ip(),
         )
         if result["ok"]:
-            # BUG-09：自动切到登录页，并把刚注册的用户名填好
-            st.session_state.login_username = username.strip()
-            st.session_state.auth_notice = "注册成功，请输入密码登录。"
+            # 注册成功即进入登录态，和正常登录成功后的状态完全一致。
+            user = result["user"]
+            st.session_state.user = {
+                "id": user["id"],
+                "username": user["username"],
+            }
+            _reset_chat_state()
+            # 下次退出登录时回到登录页，而不是停留在注册页。
             st.session_state._switch_to_login = True
             st.session_state.pop("turnstile_token", None)
             st.rerun()

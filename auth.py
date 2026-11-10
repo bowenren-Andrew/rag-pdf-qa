@@ -357,11 +357,15 @@ def register(
 
 def login(username: str, password: str) -> dict | None:
     """
-    登录校验。失败统一返回 None —— 不区分"用户名不存在"与"密码错误"，
-    避免攻击者据此枚举用户名。
+    登录校验，支持用户名或完整邮箱地址。
+    先按用户名查，查不到再按邮箱查（邮箱统一小写后比对）。
+    失败统一返回 None —— 不区分"账号不存在"与"密码错误"，
+    避免攻击者据此枚举账号。
     """
-    username = (username or "").strip()
-    user = db.get_user_by_username(username)
+    identifier = (username or "").strip()
+    user = db.get_user_by_username(identifier)
+    if user is None and "@" in identifier:
+        user = db.get_user_by_email(normalize_email(identifier))
     if user is None:
         # 用户不存在时也跑一次哈希，让响应时间与密码错误时接近（防时序探测）
         hash_password(password or "")

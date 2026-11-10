@@ -64,10 +64,11 @@ def test_缺少邮箱验证码不能创建账号(monkeypatch, tmp_db):
     _click(at, "注册")
 
     assert db.get_user_by_username("register_flow") is None
+    assert at.session_state.get("user") is None
     assert any("验证码" in e.value for e in at.error)
 
 
-def test_完整验证流程注册成功并切回登录页(monkeypatch, tmp_db):
+def test_完整验证流程注册成功并直接进入应用(monkeypatch, tmp_db):
     at = _open_register(monkeypatch)
     _set_turnstile_token(at, "test-token")
     _fill_register_form(at)
@@ -78,10 +79,11 @@ def test_完整验证流程注册成功并切回登录页(monkeypatch, tmp_db):
     _fill_register_form(at, code="123456")
     _click(at, "注册")
 
-    assert at.radio[0].value == "登录"
-    assert next(t for t in at.text_input if t.label == "用户名").value == "register_flow"
-    assert any("注册成功" in s.value for s in at.success)
+    assert at.session_state["user"]["username"] == "register_flow"
     assert db.get_user_by_username("register_flow") is not None
+    assert not any("请输入密码登录" in s.value for s in at.success)
+    assert not any(t.label == "用户名或邮箱" for t in at.text_input)
+    assert any("今日剩余额度" in m.value for m in at.markdown)
 
 
 def test_没有Turnstile_token不能注册(monkeypatch, tmp_db):
@@ -97,3 +99,4 @@ def test_没有Turnstile_token不能注册(monkeypatch, tmp_db):
     register_button = next(b for b in at.button if b.label == "注册")
     assert register_button.disabled is True
     assert db.get_user_by_username("register_flow") is None
+    assert at.session_state.get("user") is None

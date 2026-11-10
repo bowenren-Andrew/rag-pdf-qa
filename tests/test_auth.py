@@ -94,8 +94,8 @@ def test_启动迁移清空历史用户Key(tmp_db):
 
 
 # ---------------- 注册与登录（走数据库） ----------------
-def test_注册成功后可以登录(register_verified):
-    """正常注册后应能用同一组账号密码登录成功。"""
+def test_用户名登录成功(register_verified):
+    """注册后可以用用户名登录。"""
     result = register_verified("alice", "AlicePass123")
     assert result["ok"] is True
     assert result["user"]["username"] == "alice"
@@ -104,6 +104,41 @@ def test_注册成功后可以登录(register_verified):
     user = auth.login("alice", "AlicePass123")
     assert user is not None
     assert user["id"] == result["user"]["id"]
+
+
+def test_邮箱登录成功(register_verified):
+    """注册后可以用完整邮箱登录；邮箱大小写不敏感。"""
+    result = register_verified("bobby", "BobbyPass123")
+    email = result["user"]["email"]
+    assert email
+
+    user = auth.login(email, "BobbyPass123")
+    assert user is not None
+    assert user["id"] == result["user"]["id"]
+    assert auth.login(email.upper(), "BobbyPass123")["id"] == result["user"]["id"]
+
+
+def test_邮箱不存在时登录失败(tmp_db):
+    """不存在的邮箱返回 None，不抛异常。"""
+    assert auth.login("nobody@example.com", "Password123") is None
+
+
+def test_邮箱登录密码错误时返回None(register_verified):
+    """邮箱存在但密码错误，与用户名密码错误一样返回 None。"""
+    result = register_verified("wrongpass", "Wrongpass123")
+    assert auth.login(result["user"]["email"], "bad-password") is None
+
+
+def test_未验证邮箱账号用邮箱登录被拦回(tmp_db):
+    """邮箱未验证的账号即使密码正确，也要用中文提示拦回。"""
+    db.create_user(
+        "unverified_email",
+        auth.hash_password("Password123"),
+        email="unverified@example.com",
+        email_verified_at=None,
+    )
+    with pytest.raises(auth.AuthFriendlyError, match="邮箱验证"):
+        auth.login("unverified@example.com", "Password123")
 
 
 def test_用户名重复时给出中文提示(register_verified):
