@@ -168,7 +168,6 @@ def test_流式回答把历史拼进了提示词():
                 "本轮新问",
                 CONTEXTS,
                 history=[{"role": "user", "content": "上一轮问"}, {"role": "assistant", "content": "上一轮答"}],
-                api_key="sk-fake",
             )
         )
 
@@ -182,7 +181,7 @@ def test_流式回答不传历史时提示词不含历史段():
     """不传 history 时行为与 v3 一致，不出现对话历史段。"""
     client = _stream_client(["ok"])
     with patch("qa.OpenAI", return_value=client):
-        "".join(stream_answer("本轮新问", CONTEXTS, api_key="sk-fake"))
+        "".join(stream_answer("本轮新问", CONTEXTS))
 
     sent_prompt = client.chat.completions.create.call_args.kwargs["messages"][-1]["content"]
     assert "对话历史" not in sent_prompt
@@ -199,7 +198,7 @@ def test_超长历史会被截断后再送入请求():
         {"role": "assistant", "content": "最近的回答"},
     ]
     with patch("qa.OpenAI", return_value=client):
-        "".join(stream_answer("本轮新问", CONTEXTS, history=history, api_key="sk-fake"))
+        "".join(stream_answer("本轮新问", CONTEXTS, history=history))
 
     sent_prompt = client.chat.completions.create.call_args.kwargs["messages"][-1]["content"]
     assert "很旧的问题" not in sent_prompt

@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-auth.py 的单元测试（密码哈希 / Key 加解密 / 掩码 / 注册校验）
+auth.py 的单元测试（密码哈希 / 平台 Key 读取 / 历史 Key 清理 / 注册校验）
 
 测试原则：
 1. 用 conftest 的 tmp_db fixture 指向临时 sqlite，不碰本地 app.db，更不连云端数据库；
-2. 用随机生成的 Fernet 密钥做加解密测试，不使用真实 APP_SECRET_KEY；
+2. 不依赖真实 .env 里的 DEEPSEEK_API_KEY；
 3. 不发任何网络请求，因此不会调用真实的 DeepSeek API。
 """
 import pytest
@@ -61,37 +61,36 @@ def test_密码少于8位被拒绝():
     assert auth.validate_password("12345678")[0] is True
 
 
-# ---------------- API Key 加解密与掩码 ----------------
-def test_Key加密后可以解密还原(fernet_key):
-    """Fernet 加密后再解密，必须得到原文。"""
-    plain = "sk-unit-test-key-abcdefg"
-    cipher = auth.encrypt_key(plain)
-    assert cipher != plain  # 密文当然不能等于明文
-    assert auth.decrypt_key(cipher) == plain
+# ---------------- 平台 Key 读取 ----------------
+def test_平台Key从环境变量读取(monkeypatch):
+    """统一 Key 只从平台配置读取。"""
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-platform-test-123456")
+    assert auth.get_platform_api_key() == "sk-platform-test-123456"
 
 
-def test_掩码只保留前四位和后四位(fernet_key):
-    """设置页展示的 Key 必须打码：前 4 位 + 星号 + 后 4 位。"""
-    masked = auth.mask_key("sk-ab60751e3d6b46628308b1ef631377f2")
-    assert masked.startswith("sk-a")
-    assert masked.endswith("77f2")
-    assert "60751e3d" not in masked  # 中间敏感部分不能出现
-    assert "*" in masked
-
-
-def test_未设置Key时掩码显示为未设置(fernet_key):
-    """没填 Key 时展示「未设置」，而不是空字符串。"""
-    assert auth.mask_key("") == "未设置"
-    assert auth.mask_key("   ") == "未设置"
-
-
-def test_未配置服务密钥时给出中文提示(monkeypatch):
-    """APP_SECRET_KEY 缺失时，应抛出带操作指引的中文错误。"""
-    monkeypatch.delenv("APP_SECRET_KEY", raising=False)
-    # 连 .env 兜底一起屏蔽，模拟“服务端完全没配密钥”的场景
+def test_平台Key未配置时返回空字符串(monkeypatch):
+    """服务端没配平台 Key 时返回空字符串，由界面给出中文提示。"""
+    monkeypatch.delenv("DEEPSEEK_API_KEY", raising=False)
     monkeypatch.setattr(auth, "_get_secret", lambda name: "")
-    with pytest.raises(auth.AuthFriendlyError, match="APP_SECRET_KEY"):
-        auth.encrypt_key("sk-some-key")
+    assert auth.get_platform_api_key() == ""
+
+
+def test_启动迁移清空历史用户Key(tmp_db):
+    """老库的 users.api_key_enc 必须在启动迁移时置空，不能继续留在库里。"""
+    with db.get_engine().begin() as conn:
+        conn.exec_driver_sql("ALTER TABLE users ADD COLUMN api_key_enc TEXT")
+        conn.exec_driver_sql(
+            "INSERT INTO users (username, password_hash, api_key_enc, tier, created_at) "
+            "VALUES ('legacy_key_user', 'x', 'legacy-cipher', 'free', CURRENT_TIMESTAMP)"
+        )
+
+    db.init_db()
+
+    with db.get_engine().connect() as conn:
+        value = conn.exec_driver_sql(
+            "SELECT api_key_enc FROM users WHERE username = 'legacy_key_user'"
+        ).scalar()
+    assert value is None
 
 
 # ---------------- 注册与登录（走数据库） ----------------
@@ -136,53 +135,3 @@ def test_修改密码需要正确的旧密码(register_verified):
     assert auth.login("carol", "NewPass123456") is not None
 
 
-def test_用户Key存取与删除(register_verified, fernet_key):
-    """设置页保存的 Key 应能解密读回，删除后读为空字符串。"""
-    user = register_verified("dave", "DavePass123")["user"]
-    key = "sk-" + "d" * 32
-    auth.set_user_api_key(user["id"], key)
-    assert auth.get_user_api_key(user["id"]) == key
-
-    auth.delete_user_api_key(user["id"])
-    assert auth.get_user_api_key(user["id"]) == ""
-
-
-def test_密文确实写进了数据库(register_verified, fernet_key):
-    """落库的必须是密文，不能直接是明文 Key。"""
-    user = register_verified("erin", "ErinPass123")["user"]
-    key = "sk-" + "e" * 32
-    auth.set_user_api_key(user["id"], key)
-    stored = db.get_user_by_id(user["id"])
-    assert stored["api_key_enc"] != key
-    assert key not in stored["api_key_enc"]
-
-
-# ---------------- API Key 格式校验（BUG-04） ----------------
-@pytest.mark.parametrize(
-    "key, ok",
-    [
-        ("sk-" + "a" * 32, True),          # 正常的 DeepSeek Key 形态
-        ("sk-ab_" + "b" * 28, True),       # 允许下划线/短横线
-        ("abc", False),                    # 缺少 sk- 前缀
-        ("", False),                       # 空输入
-        ("pk-" + "a" * 32, False),         # 前缀不对
-        ("sk-short", False),               # 长度不足
-        ("sk-" + "a" * 200, False),        # 长度超限
-        ("sk-" + "a" * 30 + "!", False),   # 含非法字符
-    ],
-)
-def test_API_Key格式校验(key, ok):
-    """保存前只放行 sk- 前缀、合理长度、合法字符集的 Key。"""
-    assert auth.validate_api_key_format(key)[0] is ok
-
-
-def test_保存非法Key被拒绝且不落库(register_verified, fernet_key):
-    """abc 这类非法 Key 必须在落库前被拒绝，并给出明确的中文提示。"""
-    user = register_verified("frank", "FrankPass123")["user"]
-
-    with pytest.raises(auth.AuthFriendlyError) as exc:
-        auth.set_user_api_key(user["id"], "abc")
-
-    assert "sk-" in str(exc.value)
-    assert auth.get_user_api_key(user["id"]) == ""
-    assert db.get_user_by_id(user["id"])["api_key_enc"] is None

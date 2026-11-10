@@ -1,9 +1,9 @@
 # -*- coding: utf-8 -*-
 """v3.9 防刷注册：邮箱验证码、Turnstile、同 IP 注册与额度双限。"""
 from datetime import datetime, timedelta
+import secrets
 
 import pytest
-from cryptography.fernet import Fernet
 
 import auth
 import db
@@ -18,7 +18,7 @@ def _noop_send(_email, _code):
 @pytest.fixture
 def anti_abuse_env(monkeypatch, tmp_db):
     """固定验证码、跳过真实邮件/Turnstile，并配置验证码哈希所需的密钥。"""
-    monkeypatch.setenv("APP_SECRET_KEY", Fernet.generate_key().decode())
+    monkeypatch.setenv("APP_SECRET_KEY", secrets.token_urlsafe(32))
     monkeypatch.setattr(
         auth.turnstile, "verify_token", lambda token, remote_ip=None: (True, "")
     )

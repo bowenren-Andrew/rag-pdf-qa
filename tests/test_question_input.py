@@ -52,11 +52,10 @@ def test_超过2000字被提示并禁止提交(tmp_db):
     assert len(at.text_area[0].value or "") == 2001
     assert any("超过上限 2000 字" in w.value for w in at.warning)
     assert next(b for b in at.button if b.label == "发送").proto.disabled is True
-    assert not any("还没有填写 DeepSeek API Key" in w.value for w in at.warning)
 
 
 def test_2000字以内可进入提交流程(tmp_db, monkeypatch):
-    """恰好 2000 字应通过长度校验；没有自填 Key 时走平台 Key。"""
+    """恰好 2000 字应通过长度校验；提问统一走平台 Key。"""
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-platform-test-1234567890")
     at = _open_chat(tmp_db, "question_ok")
 

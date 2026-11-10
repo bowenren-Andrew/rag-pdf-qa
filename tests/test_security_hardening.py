@@ -3,15 +3,12 @@
 v3.5 安全加固（P3-1 / P3-2 / P3-3）的单元与界面测试。
 
 - P3-1：恶意文件名在 Markdown 渲染点只显示为纯文本，不生成链接/图片；
-- P3-2：保存或删除 Key 后，设置页输入框被清空；
 - P3-3：异常日志与上游错误文案里的 sk- 明文被脱敏。
 """
-import logging
 import os
 import re
 
 import httpx
-import pytest
 from openai import APIStatusError
 from streamlit.testing.v1 import AppTest
 
@@ -29,9 +26,6 @@ MALICIOUS_NAME = (
     "![IMG](http://evil.example/a.png)"
     "<script>alert(1)</script>"
 )
-FAKE_KEY_A = "sk-" + "a" * 32
-FAKE_KEY_B = "sk-" + "b" * 32
-FAKE_KEY_C = "sk-" + "c" * 32
 LEAKED_KEY = "sk-AUDIT1234567890ABCDEFGHIJKLMN"
 
 
@@ -78,10 +72,6 @@ def _seed_document(user_id: int, filename: str) -> int:
         [{"page": 1, "text": "片段内容", "embedding": b"\x00" * 8, "vector": None}],
     )
     return doc_id
-
-
-def _key_input(at: AppTest):
-    return next(t for t in at.text_input if t.label == "填入新的 Key")
 
 
 # ---------------- P3-1：文件名 Markdown 注入 ----------------
@@ -159,43 +149,6 @@ def test_引用来源的文件名只显示为纯文本(tmp_db):
     assert not _raw_markdown_link(body)
 
 
-# ---------------- P3-2：保存/删除后清空 Key 输入框 ----------------
-def test_保存Key成功后输入框清空(tmp_db, fernet_key, monkeypatch):
-    class _FakeModels:
-        def list(self):
-            return {"data": []}
-
-    class _FakeOpenAI:
-        def __init__(self, **kwargs):
-            self.models = _FakeModels()
-
-    monkeypatch.setattr(qa, "OpenAI", _FakeOpenAI)
-    user = _new_user(tmp_db, "sec_key_clear_save")
-    at = _open_page(user, "设置")
-
-    _key_input(at).set_value(FAKE_KEY_A)
-    next(b for b in at.button if b.label == "保存 Key").click().run()
-
-    assert _key_input(at).value in ("", None)
-    assert at.session_state["_api_key_input_version"] == 1
-    assert "new_api_key_input_0" not in at.session_state
-    assert db.get_user_by_id(user["id"])["api_key_enc"]
-
-
-def test_删除Key后输入框清空(tmp_db, fernet_key):
-    user = _new_user(tmp_db, "sec_key_clear_delete")
-    auth.set_user_api_key(user["id"], FAKE_KEY_B)
-    at = _open_page(user, "设置")
-
-    _key_input(at).set_value(FAKE_KEY_C).run()
-    next(b for b in at.button if b.label == "删除已保存的 Key").click().run()
-
-    assert _key_input(at).value in ("", None)
-    assert at.session_state["_api_key_input_version"] == 1
-    assert "new_api_key_input_0" not in at.session_state
-    assert db.get_user_by_id(user["id"])["api_key_enc"] is None
-
-
 # ---------------- P3-3：日志与错误文案脱敏 ----------------
 def test_redact_secrets_替换密钥且不误伤普通单词():
     text = f"Bearer {LEAKED_KEY} rejected; risks-management task-list"
@@ -228,19 +181,3 @@ def test_friendly错误提示脱敏普通异常():
     assert "sk-****" in message
 
 
-def test_校验Key日志不写明文(monkeypatch, caplog):
-    class _BoomClient:
-        def __init__(self, **kwargs):
-            self.models = self
-
-        def list(self):
-            raise RuntimeError(f"rejected {LEAKED_KEY}")
-
-    monkeypatch.setattr(qa, "OpenAI", _BoomClient)
-
-    with caplog.at_level(logging.WARNING, logger="qa"):
-        with pytest.raises(qa.QAFriendlyError):
-            qa.verify_api_key(FAKE_KEY_A)
-
-    assert "AUDIT1234" not in caplog.text
-    assert "sk-****" in caplog.text

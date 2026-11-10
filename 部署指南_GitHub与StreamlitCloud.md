@@ -15,7 +15,7 @@
 | GitHub 仓库创建 | ✅ 已完成 | **私有仓库**：https://github.com/bowenren-Andrew/rag-pdf-qa |
 | 代码推送 | ✅ 已完成 | 分支 `master`，已同步远程 |
 | 敏感文件核查 | ✅ 已确认 | 远程仓库**只有** `.env.example`（模板），真实 `.env` 未上传 |
-| 账号登录 + 平台 Key | ✅ 已写入 `app.py` | 注册即可用，无需自备 Key；老用户可自填覆盖 |
+| 账号登录 + 平台 Key | ✅ 已写入 `app.py` | 所有用户统一走平台 Key，用户不用填 Key |
 | Streamlit Cloud 部署 | ⬜ 待你操作 | 见「二、部署到 Streamlit Cloud」，约 5 分钟 |
 | 平台 Key 配置 | ⬜ 待你操作 | 见「三、设置平台 Key 与 Secrets」，1 分钟 |
 
@@ -117,7 +117,7 @@ https://bowenren-andrew-rag-pdf-qa-app-xxxxxx.streamlit.app
 
 ```toml
 DATABASE_URL = "postgresql://postgres.xxxx:你的密码@aws-0-xxx.pooler.supabase.com:5432/postgres"
-APP_SECRET_KEY = "你的Fernet密钥"
+APP_SECRET_KEY = "你的随机密钥"
 DEEPSEEK_API_KEY = "sk-你自己的DeepSeek官方Key"
 TURNSTILE_SITE_KEY = "你的Cloudflare-Turnstile-Site-Key"
 TURNSTILE_SECRET_KEY = "你的Cloudflare-Turnstile-Secret-Key"
@@ -134,6 +134,7 @@ SMTP_SECURITY = "starttls"
 > `DEEPSEEK_API_KEY` 必须是 DeepSeek **官方** Key（`api.deepseek.com`，模型 `deepseek-flash`），
 > 不要使用临时 trycloudflare 网关。平台 Key 不会显示在页面上，也不会写进日志。
 > 门禁已由账号登录取代，`APP_PASSWORD` 不再使用。
+> `APP_SECRET_KEY` 只用于邮箱验证码 HMAC，可用 `python -c "import secrets; print(secrets.token_urlsafe(32))"` 生成。
 
 ### 3.2 平台 Key 与额度是怎么生效的
 
@@ -145,7 +146,7 @@ _sync_secrets_to_env()                 # ① 把 Secrets 同步进环境变量
 ↓
 auth.get_platform_api_key()            # ② 只读 DEEPSEEK_API_KEY
 ↓
-_current_api_key()                     # ③ 用户自填 Key 优先，否则用平台 Key
+_current_api_key()                     # ③ 所有用户只读平台 Key
 ↓
 quota.check_question/upload/summary()  # ④ 调用前按当天 daily_usage 行查额度
 ```
@@ -153,9 +154,19 @@ quota.check_question/upload/summary()  # ④ 调用前按当天 daily_usage 行�
 关键设计：
 
 - **平台 Key 只在服务端读取**：不写进代码、不写进日志、不在页面展示
-- **自填 Key 可选**：老用户想用自己的 Key 仍可在设置页填写；空着也能正常用
+- **统一平台 Key**：免费和付费用户都只走平台 Key；tier 只决定额度，不决定 Key
 - **每天 0 点清零**：日期按北京时间取 `YYYY-MM-DD`，只查当天 `daily_usage` 行，不需要定时任务
 - **超限先拦截**：直接给中文提示，不调用 DeepSeek API、不扣次数
+
+### 3.2.1 升级到 v3.10：历史用户 Key 清理
+
+老库 `users.api_key_enc` 里的历史用户 Key 会在应用启动迁移时**一次性置为 `NULL`**
+（幂等；新库没有该列会跳过）。升级前请先备份数据库：
+
+- Supabase：确认已开启自动备份，或先 `pg_dump` 一份；
+- 本地 sqlite：复制 `app.db` 为带时间戳的备份后再启动应用。
+
+清理后设置页不再显示任何 Key，所有用户提问都走平台 Key。
 
 ### 3.3 手动开通付费版（9.9/月）
 
@@ -175,6 +186,8 @@ python -c "import db; print(db.set_user_tier_by_username('用户名', 'paid'))"
 部署完成后逐项确认，全部打勾才算真正可用：
 
 - [ ] 新注册账号不填 Key 也能直接提问（平台 Key 生效）
+- [ ] 设置页只有账号信息与修改密码，没有填 Key / 保存 Key / 删除 Key 入口
+- [ ] 老账号升级后 `users.api_key_enc` 已为空，提问仍走平台 Key
 - [ ] 顶部「今日剩余额度」显示真实数字（免费版 5 问 / 3 个文档）
 - [ ] 免费账号第 6 次提问被拦，提示写明明天 0 点恢复与付费版额度
 - [ ] 手动把账号 tier 改成 `paid` 后，刷新可见 50 问 / 50 个文档
@@ -246,9 +259,10 @@ torch>=2.0 ; sys_platform != "linux"            # 本地 Windows/macOS 不受影
 
 ## 七、与平台 Key / 额度相关的代码改动
 
-1. **`_sync_secrets_to_env()`** —— 云端适配。Streamlit Cloud 的 Secrets 不保证自动进入 `os.environ`，而 `qa.py` 是用 `os.getenv()` 读 Key 的。显式同步一次，保证「本地 `.env`」和「云端 Secrets」走同一套读取逻辑。
-2. **`auth.get_platform_api_key()` / `_current_api_key()`** —— 平台 Key 读取与用户自填 Key 覆盖；两者都没有时才给中文提示。
+1. **`_sync_secrets_to_env()`** —— 云端适配。Streamlit Cloud 的 Secrets 不保证自动进入 `os.environ`，而 `auth.get_platform_api_key()` 优先读环境变量。显式同步一次，保证「本地 `.env`」和「云端 Secrets」走同一套读取逻辑。
+2. **`auth.get_platform_api_key()` / `_current_api_key()`** —— 只读平台 Key；未配置时给中文提示。
 3. **`quota.py` + `daily_usage` 表** —— free/paid 每日额度、文档总数与调用前拦截；日期按北京时间查当天行，0 点自动重置。
+4. **`db.clear_legacy_api_keys()` + 启动迁移** —— 把老库 `users.api_key_enc` 置空，不再保存任何用户 Key。
 
 配套改动：`.gitignore` 增加 `.streamlit/secrets.toml`、`.pytest_cache/`；`.env.example` 增加 `DEEPSEEK_API_KEY` 注释行。
 

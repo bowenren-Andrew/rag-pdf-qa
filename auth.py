@@ -1,10 +1,11 @@
 # -*- coding: utf-8 -*-
 """
-auth.py（v3）
-职责：账号体系与密钥安全（单一职责：不含界面、不含向量与问答逻辑）。
+auth.py（v3.10）
+职责：账号体系与平台密钥读取（单一职责：不含界面、不含向量与问答逻辑）。
 - 密码：hashlib.pbkdf2_hmac("sha256", 随机 16 字节盐, 480000 次迭代)，盐与哈希一起存库；
         校验用 hmac.compare_digest 做定长时间比较，避免时序侧信道。
-- 用户的 DeepSeek Key：用 cryptography 的 Fernet 对称加密后落库，密钥来自环境变量 APP_SECRET_KEY。
+- DeepSeek Key：只读取平台统一 Key（Streamlit Secrets / 环境变量 / 本地 .env），
+        不再接收、加密或保存任何用户自填 Key。
 - 所有面向用户的失败原因都抛出 AuthFriendlyError（中文提示），界面层直接展示。
 - 登录限流：连续失败 5 次按账号锁定 15 分钟（进程内计数，重启后清零）。
 """
@@ -17,8 +18,6 @@ import secrets
 import threading
 import time
 from datetime import datetime, timedelta, timezone
-
-from cryptography.fernet import Fernet, InvalidToken
 
 import db
 import mailer
@@ -75,12 +74,6 @@ EMAIL_CODE_MAX_ATTEMPTS = 5
 MAX_REGISTRATIONS_PER_IP_PER_DAY = 3
 
 BEIJING_TZ = timezone(timedelta(hours=8))
-
-# DeepSeek Key 格式：sk- 前缀 + 17–125 位字母/数字/短横线/下划线（总长 20–128）
-_API_KEY_RE = re.compile(r"^sk-[A-Za-z0-9_-]{17,125}$")
-API_KEY_MIN_LEN = 20
-API_KEY_MAX_LEN = 128
-
 
 class AuthFriendlyError(Exception):
     """面向用户的中文友好错误，界面直接 str(e) 展示即可。"""
@@ -260,25 +253,6 @@ def request_email_code(email: str, sender=None) -> dict:
 def is_email_verified(user: dict | None) -> bool:
     """账号是否完成邮箱验证；历史账号在迁移时已补上验证时间。"""
     return bool(user and user.get("email_verified_at") is not None)
-
-
-def validate_api_key_format(key: str) -> tuple[bool, str]:
-    """只校验 DeepSeek Key 的格式（前缀 + 长度 + 字符集），不发起网络请求。"""
-    key = (key or "").strip()
-    if not key:
-        return False, "请输入要保存的 API Key。"
-    if not key.startswith("sk-"):
-        return False, "Key 格式不正确：应以 sk- 开头，请检查后重新填写。"
-    if not API_KEY_MIN_LEN <= len(key) <= API_KEY_MAX_LEN:
-        return False, (
-            f"Key 长度不正确（应为 {API_KEY_MIN_LEN}–{API_KEY_MAX_LEN} 位），"
-            "请检查后重新填写。"
-        )
-    if not _API_KEY_RE.match(key):
-        return False, (
-            "Key 格式不正确：只能包含字母、数字、短横线和下划线，请检查后重新填写。"
-        )
-    return True, ""
 
 
 # ---------------- 注册与登录 ----------------
@@ -502,65 +476,6 @@ def format_lock_remaining(seconds: int) -> str:
     return f"{rest} 秒"
 
 
-# ---------------- API Key 加解密 ----------------
-def _fernet() -> Fernet:
-    """构造 Fernet 实例；未配置 APP_SECRET_KEY 时给出可操作的中文提示。"""
-    key = _get_secret("APP_SECRET_KEY")
-    if not key:
-        raise AuthFriendlyError(
-            "服务端未配置 APP_SECRET_KEY，无法加密保存你的 Key。"
-            "本地请在 .env 中加一行（生成命令）：\n"
-            'python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"'
-        )
-    try:
-        return Fernet(key.encode("utf-8"))
-    except Exception:
-        raise AuthFriendlyError(
-            "APP_SECRET_KEY 不是合法的 Fernet 密钥，请重新生成：\n"
-            'python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"'
-        )
-
-
-def encrypt_key(plain: str) -> str:
-    """加密明文 Key，返回密文字符串（bytes → str）。"""
-    return _fernet().encrypt(plain.encode("utf-8")).decode("utf-8")
-
-
-def decrypt_key(cipher: str) -> str:
-    """解密得到明文 Key；密文损坏时给出中文提示。"""
-    try:
-        return _fernet().decrypt(cipher.encode("utf-8")).decode("utf-8")
-    except InvalidToken:
-        raise AuthFriendlyError(
-            "你的 API Key 解密失败（可能是服务端密钥已更换），请在设置页重新填写。"
-        )
-
-
-def mask_key(plain: str) -> str:
-    """
-    把 Key 显示成掩码形式：保留前 4 位和后 4 位，中间打码。
-    未设置时返回「未设置」，短 Key 只保留首位。
-    """
-    key = (plain or "").strip()
-    if not key:
-        return "未设置"
-    if len(key) <= 8:
-        return key[0] + "*" * (len(key) - 1)
-    return f"{key[:4]}{'*' * 8}{key[-4:]}"
-
-
-# ---------------- 用户 Key 的读写 ----------------
-def get_user_api_key(user_id: int) -> str:
-    """读取并解密当前用户的 API Key；未设置或解密失败返回空字符串。"""
-    user = db.get_user_by_id(user_id)
-    if user is None or not user.get("api_key_enc"):
-        return ""
-    try:
-        return decrypt_key(user["api_key_enc"])
-    except AuthFriendlyError:
-        return ""  # 解密失败当作未设置处理，界面会引导用户重新填写
-
-
 def get_platform_api_key() -> str:
     """
     读取平台方统一的 DeepSeek Key。
@@ -568,18 +483,3 @@ def get_platform_api_key() -> str:
     不写进代码、不写日志、不在页面展示。
     """
     return _get_secret("DEEPSEEK_API_KEY")
-
-
-def set_user_api_key(user_id: int, plain: str) -> str:
-    """加密保存用户的 API Key，返回掩码形式用于界面回显。"""
-    plain = (plain or "").strip()
-    ok, msg = validate_api_key_format(plain)
-    if not ok:
-        raise AuthFriendlyError(msg)
-    db.update_api_key_enc(user_id, encrypt_key(plain))
-    return mask_key(plain)
-
-
-def delete_user_api_key(user_id: int):
-    """删除用户已保存的 Key（置空）。"""
-    db.update_api_key_enc(user_id, None)

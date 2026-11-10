@@ -1,10 +1,9 @@
 # -*- coding: utf-8 -*-
 """
-qa.py（v3.1）
+qa.py（v3.10）
 职责：调用 DeepSeek API 生成回答（单一职责，不涉及界面与向量库）。
-- v3 变更：API Key **不再读全局环境变量**，改为由调用方传入（每位用户使用自己在
-  「设置」页填写、经 Fernet 加密保存后解密出来的 Key）；
-  仅保留 get_api_key() 作为本地开发/单元测试的兼容回退。
+- DeepSeek Key 只读平台统一配置（Streamlit Secrets / 环境变量 / 本地 .env），
+  不再接收或使用任何用户自填 Key。
 - v3.1 变更：stream_answer / generate_answer 增加可选参数 history，支持多轮对话；
   提示词改为「系统提示 → 对话历史 → 参考资料 → 当前问题」四段，
   并明确历史只作背景参考、回答仍只依据本次参考资料。
@@ -186,65 +185,24 @@ class QAFriendlyError(Exception):
 
 def get_api_key() -> str:
     """
-    读取全局兜底 Key（系统环境变量或 .env）。
-    v3.8 说明：主路径由 app.py 传入平台 Key 或用户自填 Key；此函数仅作本地开发与单元测试的兼容回退。
+    读取平台统一 Key（Streamlit Secrets / 系统环境变量 / 本地 .env）。
+    不读取、不接收任何用户自填 Key。
     """
-    return os.environ.get("DEEPSEEK_API_KEY", "").strip()
+    import auth
+
+    return auth.get_platform_api_key()
 
 
-def _require_client(api_key: str = None) -> OpenAI:
+def _require_client() -> OpenAI:
     """
-    校验 API Key 并创建客户端。
-    :param api_key: 当前登录用户的明文 Key（由 auth 模块解密后传入）；
-                    不传时回退读全局环境变量（本地兼容/测试用）。
-    Key 缺失时抛出中文友好提示。
+    校验平台 Key 并创建客户端；Key 缺失时抛出中文友好提示。
     """
-    key = (api_key or "").strip() or get_api_key()
+    key = get_api_key()
     if not key:
         raise QAFriendlyError(
-            "未检测到 API Key。平台 Key 未配置，且你没有填写自己的 DeepSeek Key；"
-            "请联系管理员或在「⚙️ 设置」页填写。"
+            "平台 DeepSeek Key 未配置，暂时无法调用模型，请联系管理员。"
         )
     return OpenAI(api_key=key, base_url=BASE_URL, timeout=60)
-
-
-def verify_api_key(api_key: str) -> None:
-    """
-    用 GET /models 做一次轻量鉴权：只验证 Key，不消耗 token、不生成内容。
-    :raises QAFriendlyError: Key 无效、无权限、网络失败或接口异常（均为中文提示）
-    """
-    key = (api_key or "").strip()
-    if not key:
-        raise QAFriendlyError("请输入要保存的 API Key。")
-    client = OpenAI(api_key=key, base_url=BASE_URL, timeout=10, max_retries=0)
-    try:
-        client.models.list()
-    except AuthenticationError as e:
-        raise QAFriendlyError(
-            "Key 校验失败：该 Key 无效或已过期，请确认后重新填写。"
-        ) from e
-    except APITimeoutError as e:
-        raise QAFriendlyError(
-            "Key 校验超时，请检查网络后重试（Key 未保存）。"
-        ) from e
-    except APIConnectionError as e:
-        raise QAFriendlyError(
-            "无法连接 DeepSeek 校验 Key，请检查网络后重试（Key 未保存）。"
-        ) from e
-    except APIStatusError as e:
-        if e.status_code in (401, 403):
-            raise QAFriendlyError(
-                "Key 校验失败：该 Key 无效或没有访问权限，请确认后重新填写。"
-            ) from e
-        raise QAFriendlyError(
-            f"Key 校验失败：DeepSeek 接口返回 HTTP {e.status_code}，"
-            "请稍后重试（Key 未保存）。"
-        ) from e
-    except Exception as e:
-        logger.warning("校验 DeepSeek Key 失败：%s", redact_secrets(e))
-        raise QAFriendlyError(
-            "Key 校验失败：无法完成验证，请稍后重试（Key 未保存）。"
-        ) from e
 
 
 # 多轮对话历史的字符上限：超出时从最旧的消息开始丢弃，最近一轮问答一定保留
@@ -318,7 +276,7 @@ def _friendly(e: Exception) -> QAFriendlyError:
     """把 SDK 异常统一转换成中文友好错误。"""
     if isinstance(e, AuthenticationError):
         return QAFriendlyError(
-            "你填写的 DeepSeek API Key 无效或已过期，请到「⚙️ 设置」页更新。"
+            "平台 DeepSeek Key 无效或已过期，请联系管理员更新平台 Key。"
         )
     if isinstance(e, APITimeoutError):
         return QAFriendlyError("调用 DeepSeek API 超时，请检查网络后重试。")
@@ -335,7 +293,6 @@ def generate_answer(
     question: str,
     contexts: list[dict],
     history: list[dict] = None,
-    api_key: str = None,
     usage_out: dict = None,
 ) -> str:
     """
@@ -343,7 +300,7 @@ def generate_answer(
     :param history: 可选，多轮对话历史 [{"role","content"}, ...]，内部会先做截断保护
     :param usage_out: 可选，传入空 dict 时把 API 返回的用量写进去（供界面展示）
     """
-    client = _require_client(api_key)
+    client = _require_client()
     if not contexts:
         raise QAFriendlyError("没有检索到相关内容，请先上传并成功解析文档。")
     try:
@@ -370,7 +327,6 @@ def stream_answer(
     question: str,
     contexts: list[dict],
     history: list[dict] = None,
-    api_key: str = None,
     usage_out: dict = None,
 ) -> Iterator[str]:
     """
@@ -378,7 +334,7 @@ def stream_answer(
     :param history: 可选，多轮对话历史 [{"role","content"}, ...]，内部会先做截断保护
     :param usage_out: 可选，传入空 dict 时把 API 返回的用量写进去（供界面展示）
     """
-    client = _require_client(api_key)
+    client = _require_client()
     if not contexts:
         raise QAFriendlyError("没有检索到相关内容，请先上传并成功解析文档。")
     try:
@@ -412,7 +368,6 @@ def stream_answer(
 def generate_doc_brief(
     filename: str,
     contexts: list[dict],
-    api_key: str = None,
     usage_out: dict = None,
 ) -> dict:
     """
@@ -420,7 +375,7 @@ def generate_doc_brief(
     :return: {"summary": 摘要文本, "questions": [问题1, 问题2, 问题3]}
     :param usage_out: 可选，传入空 dict 时把 API 返回的用量写进去（供界面展示）
     """
-    client = _require_client(api_key)
+    client = _require_client()
     refs = "\n\n".join(
         f"【片段{i}】（第{c['page']}页）\n{c['text']}" for i, c in enumerate(contexts, start=1)
     )

@@ -4,7 +4,7 @@
 
 
 > 上传 PDF，让大模型只依据你的文档回答问题 —— 答案流式输出，并附带命中原文片段与相似度分数。
-> 当前版本：**v3.8**（Streamlit + Supabase Postgres/pgvector + BGE 中文向量模型 + DeepSeek）
+> 当前版本：**v3.10**（Streamlit + Supabase Postgres/pgvector + BGE 中文向量模型 + DeepSeek）
 
 ---
 
@@ -21,7 +21,7 @@
 | 职责单一 | 四个文件各管一件事：解析 / 向量库 / 大模型 / 界面 |
 | 轻量部署 | 单个 Streamlit 应用即可跑通；本地 sqlite 零配置开发，云端 Postgres 一条连接串 |
 | 中文友好 | 全量中文注释；Key 缺失、网络异常、API 报错均给出中文提示，不崩溃 |
-| 密钥安全 | 平台 Key 只从 `.env`/Secrets 读取；用户自填 Key 经 Fernet 加密入库，不硬编码、不写日志、不展示 |
+| 密钥安全 | 平台 Key 只从 `.env`/Secrets 读取；用户不需要填写任何 Key，也不在库里保存用户 Key |
 | 免费额度（v3.8） | 免费版每天 5 问 / 存 3 个文档 / 每天新传 1 个；付费版 9.9/月为 50 问 / 50 个文档 / 每天新传 5 个 |
 | 全面持久化（v3.3） | 文档、片段向量、摘要、会话及其文档绑定全部存数据库，云端重启/休眠后不丢 |
 
@@ -35,7 +35,7 @@
 - **自动摘要 + 推荐问题**：文档入库后自动生成全文摘要与 3 个推荐问题，点击即可直接提问
 - **账号体系（v3）**：注册 / 登录后才可使用，密码用 PBKDF2 加盐哈希存储，绝不明文
 - **数据隔离（v3）**：知识库与会话都按 `user_id` 隔离，用户之间互相看不到对方的文档与会话
-- **平台 Key + 可选自填（v3.8）**：注册后默认使用平台统一 DeepSeek Key，不用再填 Key；老用户仍可在设置页填自己的 Key 覆盖，Fernet 加密入库、界面只显示掩码
+- **统一平台 Key（v3.10）**：所有用户（免费/付费）都只走平台统一 DeepSeek Key，注册后即可提问，设置页不再提供填 Key / 保存 Key / 删除 Key 入口；tier 只决定额度
 - **每日额度（v3.8）**：免费/付费等级、每日提问/摘要/上传次数与文档总数限制，顶部实时显示剩余；超限中文拦截，不调 API
 - **单文件硬限制（v3.8）**：单个 PDF/PPTX 最多 100 页、20MB，超限直接拒绝并提示按章节拆分
 - **会话管理**：新建 / 加载 / 删除历史会话，每轮问答自动保存到数据库（本地 sqlite 或云端 Postgres）
@@ -117,7 +117,7 @@
 | 向量存储 | 数据库 `document_chunks` 表 | 云端 Postgres + **pgvector**（SQL 余弦距离）；本地 sqlite 存 float32 字节、numpy 算余弦，两条路径结果一致 |
 | 大模型 | DeepSeek（`deepseek-flash`） | OpenAI 兼容 SDK，支持流式 |
 | 数据库 | SQLAlchemy + sqlite / Postgres | 本地 sqlite，云端接 Supabase Postgres |
-| 密码与加密 | hashlib.pbkdf2_hmac + cryptography.Fernet | 密码加盐哈希，用户 Key 对称加密 |
+| 密码与验证码 | hashlib.pbkdf2_hmac + HMAC-SHA256 | 密码加盐哈希；邮箱验证码只存 HMAC，不存明文 |
 | 配置 | python-dotenv | 从 `.env` 读取 `DATABASE_URL` / `APP_SECRET_KEY` |
 
 ### 4.2 模块职责
@@ -127,22 +127,22 @@
 | `app.py` | 界面与交互：登录注册、三页导航、流式聊天、来源展示 | `render_auth_page()` / `page_chat()` / `page_documents()` / `page_settings()` |
 | `loader.py` | PDF / PPTX 文本提取与切分（v3.1：新增 PPTX 与 OCR 兜底） | `load_and_split_pdf(file, ocr_report=)` / `load_and_split_pptx(file)` / `load_and_split_file(file, name)` → `[{text, page}]` |
 | `vectorstore.py` | 向量化与相似检索（按用户隔离，元数据含 `doc_type`） | `add_document(user_id, ...)` / `similarity_search(user_id, ...)` / `delete_document(user_id, ...)` |
-| `qa.py` | 调用 DeepSeek 生成回答（Key 由调用方传入，v3.1 支持 history） | `stream_answer(q, ctx, history=, api_key=)` / `truncate_history()` / `generate_doc_brief(...)` |
+| `qa.py` | 调用 DeepSeek 生成回答（只读平台 Key，v3.1 支持 history） | `stream_answer(q, ctx, history=, usage_out=)` / `truncate_history()` / `generate_doc_brief(...)` |
 | `db.py` | v3 新增：表定义与数据读写 | `init_db()` / `create_session()` / `list_sessions(user_id)` / `save_session()` / `delete_session()` |
-| `auth.py` | v3 新增：账号体系与密钥安全 | `register()` / `login()` / `hash_password()` / `encrypt_key()` / `mask_key()` |
+| `auth.py` | 账号体系与平台 Key 读取 | `register()` / `login()` / `hash_password()` / `get_platform_api_key()` |
 
 ### 4.3 数据流转
 
 ```mermaid
 flowchart TD
-    A[注册 / 登录] --> A1[(users 表<br/>密码哈希 + 加密 Key)]
+    A[注册 / 登录] --> A1[(users 表<br/>密码哈希，不保存用户 Key)]
     A1 --> B[上传 PDF]
     B --> C[loader.py<br/>PyPDF2 提取 + 清洗]
     C --> D[切分：约 500 字/段<br/>段间约 50 字重叠]
     D --> E[vectorstore.py<br/>BGE 中文向量化]
     E --> F[(数据库 document_chunks<br/>云端 pgvector / 本地 sqlite)]
 
-    G[用户提问] --> H[取用户解密后的 Key]
+    G[用户提问] --> H[读取平台统一 Key]
     H --> I[query 向量化<br/>加 BGE 指令前缀]
     F --> J[相似检索 Top-4<br/>仅限本人 collection]
     I --> J
@@ -183,7 +183,7 @@ source .venv/bin/activate
 pip install -r requirements.txt
 ```
 
-> 依赖：`streamlit`、`PyPDF2`、`sentence-transformers`、`openai`、`python-dotenv`、`sqlalchemy`、`psycopg[binary]`、`cryptography`、`python-pptx`、`pymupdf`、`rapidocr-onnxruntime`（v3.3 起 chromadb 已移除）
+> 依赖：`streamlit`、`PyPDF2`、`sentence-transformers`、`openai`、`python-dotenv`、`sqlalchemy`、`psycopg[binary]`、`python-pptx`、`pymupdf`、`rapidocr-onnxruntime`（v3.3 起 chromadb 已移除；v3.10 起不再需要 cryptography）
 
 ### 3. 配置环境变量
 
@@ -191,11 +191,11 @@ pip install -r requirements.txt
 cp .env.example .env
 ```
 
-v3.8 本地至少需要 `APP_SECRET_KEY`（加密用户自填 Key 用）和平台 `DEEPSEEK_API_KEY`：
+v3.10 本地至少需要 `APP_SECRET_KEY`（邮箱验证码 HMAC 用）和平台 `DEEPSEEK_API_KEY`：
 
 ```bash
 # 生成一把随机密钥，把输出粘到 .env 里
-python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"
+python -c "import secrets; print(secrets.token_urlsafe(32))"
 ```
 
 ```ini
@@ -213,9 +213,9 @@ SMTP_SECURITY=starttls
 
 `DATABASE_URL` 本地**可以留空**，程序会自动使用项目下的 sqlite 文件 `app.db`。
 
-> v3.8 说明：平台统一使用 `DEEPSEEK_API_KEY`，必须是**你自己的 DeepSeek 官方 Key**
+> v3.10 说明：所有用户统一使用平台 `DEEPSEEK_API_KEY`，必须是**你自己的 DeepSeek 官方 Key**
 > （接口地址固定 `https://api.deepseek.com`，模型固定 `deepseek-flash`）；
-> 不要使用同学提供的临时网关域名。用户自填 Key 变成可选覆盖项。
+> 不要使用同学提供的临时网关域名。用户不需要填写任何 Key，设置页也没有 Key 入口。
 > 也可以直接用系统环境变量配置（优先级高于 `.env`）。
 
 ### 4. 启动应用
@@ -229,7 +229,7 @@ streamlit run app.py
 ### 5. 开始使用
 
 1. 首次打开是登录页：切到「注册」创建账号（用户名 3–20 位字母/数字/下划线，密码至少 8 位）
-2. 登录后直接可用：默认走平台 Key，**不需要填写任何 Key**；老用户想用自己的 Key 可在「⚙️ 设置」页选填
+2. 登录后直接可用：所有用户都走平台 Key，**不需要填写任何 Key**
 3. 进「📁 我的文档」上传一个或多个 PDF → 点「解析并入库」
    （首次会自动从 `hf-mirror` 下载向量模型约 100MB，请耐心等待）
 4. 回「💬 问答」页查看自动摘要与推荐问题，或直接在底部输入框提问；
@@ -257,11 +257,11 @@ git add . && git commit -m "feat: RAG PDF QA v2" && git push
 
 ### 3. 配置 Secrets（关键）
 
-在应用页面 → **Settings → Secrets** 填入（TOML 格式），三个变量都必填：
+在应用页面 → **Settings → Secrets** 填入（TOML 格式），数据库与平台 Key 必填：
 
 ```toml
 DATABASE_URL = "postgresql://postgres.xxxx:你的密码@aws-0-xxx.pooler.supabase.com:5432/postgres"
-APP_SECRET_KEY = "你的Fernet密钥"
+APP_SECRET_KEY = "你的随机密钥"
 DEEPSEEK_API_KEY = "sk-你自己的DeepSeek官方Key"
 TURNSTILE_SITE_KEY = "你的Cloudflare-Turnstile-Site-Key"
 TURNSTILE_SECRET_KEY = "你的Cloudflare-Turnstile-Secret-Key"
@@ -273,9 +273,9 @@ SMTP_FROM = "no-reply@example.com"
 SMTP_SECURITY = "starttls"
 ```
 
-保存后应用会自动重启。这三个变量的详细获取步骤见「八、云端部署需要配置的 Secrets」。
+保存后应用会自动重启。各变量的详细获取步骤见「八、云端部署需要配置的 Secrets」。
 
-> v3.8 起平台统一使用 `DEEPSEEK_API_KEY`（官方 `api.deepseek.com`，模型 `deepseek-flash`）；
+> v3.10 起所有用户统一使用平台 `DEEPSEEK_API_KEY`（官方 `api.deepseek.com`，模型 `deepseek-flash`）；
 > `APP_PASSWORD` 已废弃，门禁改由账号登录取代。
 
 ### 4. 等待首次构建
@@ -291,24 +291,28 @@ SMTP_SECURITY = "starttls"
 | 原始文件 | 单文件最多 100 页 / 20MB，超限直接拒绝；在限制内的原始文件字节随文档入库 |
 | 会话历史**持久** | 会话及其文档绑定存在 Supabase Postgres 里，容器重启不丢（v3 相比 v2 的本地 JSON 是一大改进） |
 | 资源限制 | 免费版约 1GB 内存；`torch + bge-small-zh-v1.5` 较吃紧，不宜上传超大 PDF（v3.3 移除 Chroma 后内存压力更小） |
-| 密钥安全 | `APP_SECRET_KEY` 与数据库连接串只走 Secrets，不要把 `.env` 提交到仓库 |
+| 密钥安全 | `APP_SECRET_KEY`、`DEEPSEEK_API_KEY` 与数据库连接串只走 Secrets，不要把 `.env` 提交到仓库 |
 
 ---
 
 ## 八、云端部署需要配置的 Secrets
 
-v3.8 需要三个环境变量，缺一个都会影响使用：
+v3.10 至少需要配置数据库、平台 Key 与邮箱验证相关变量：
 
 | 变量 | 作用 | 获取方式 |
 | --- | --- | --- |
-| `DATABASE_URL` | 存用户账号、每日用量、加密后的 Key、文档与会话记录 | Supabase 项目的 Postgres 连接串（见下方步骤） |
-| `APP_SECRET_KEY` | 用 Fernet 加密每位用户的 API Key | 本地执行 `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` |
-| `DEEPSEEK_API_KEY` | 平台统一调用的官方 DeepSeek Key（注册后即可用，无需用户自填） | [platform.deepseek.com](https://platform.deepseek.com/) 自行创建；必须是官方 Key，不要用临时网关 |
+| `DATABASE_URL` | 存用户账号、每日用量、文档与会话记录（不存用户 Key） | Supabase 项目的 Postgres 连接串（见下方步骤） |
+| `APP_SECRET_KEY` | 邮箱验证码 HMAC 的服务端密钥 | 本地执行 `python -c "import secrets; print(secrets.token_urlsafe(32))"` |
+| `DEEPSEEK_API_KEY` | 平台统一调用的官方 DeepSeek Key（所有用户共用，用户不用填 Key） | [platform.deepseek.com](https://platform.deepseek.com/) 自行创建；必须是官方 Key，不要用临时网关 |
 | `TURNSTILE_SITE_KEY` / `TURNSTILE_SECRET_KEY` | 注册页人机验证（v3.9 防刷注册） | Cloudflare Dashboard → Turnstile 创建站点后获得；Secret Key 只放 Secrets，不写进代码/日志 |
 | `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASSWORD` / `SMTP_FROM` | 发送注册邮箱验证码 | 邮箱服务商的 SMTP 信息；密码填授权码，不要填网页登录密码 |
 
-> ⚠️ `APP_SECRET_KEY` 一旦更换，之前用户保存的 Key 会解密失败，
-> 届时需要请用户到「⚙️ 设置」页重新填写。
+> ⚠️ `APP_SECRET_KEY` 一旦更换，已发送但未使用的邮箱验证码会失效（重新发送即可）；
+> 它不再用于加密任何用户 Key。
+
+> **v3.10 升级清理**：老库 `users.api_key_enc` 里的历史用户 Key 会在应用启动迁移时
+> 一次性置为 `NULL`（幂等，新库无此列则跳过）。升级前请先备份数据库
+> （Supabase 自动备份或 `pg_dump`）；本地 sqlite 请先复制 `app.db`。
 
 ### 获取 Supabase 免费 Postgres 连接串（约 3 分钟）
 
@@ -379,8 +383,8 @@ pdf_qa_app/
 ├── app.py                     # Streamlit 界面（登录 + 问答 / 我的文档 / 设置 三页）
 ├── loader.py                  # PDF / PPTX 解析与文本切分（v3.1：+PPTX、+OCR 兜底）
 ├── vectorstore.py             # 向量化与检索（v3：按 user_id 隔离 collection）
-├── qa.py                      # DeepSeek 调用（v3：Key 由调用方传入；v3.1：多轮 history）
-├── auth.py                    # v3 新增：注册登录、密码哈希、Key 加解密与掩码
+├── qa.py                      # DeepSeek 调用（v3.10：只读平台 Key；v3.1：多轮 history）
+├── auth.py                    # 注册登录、密码哈希、平台 Key 读取
 ├── db.py                      # v3 新增：SQLAlchemy 数据访问（users / sessions 表）
 ├── quota.py                   # v3.8 新增：等级、每日用量与额度拦截（free / paid）
 ├── requirements.txt           # 依赖清单
@@ -395,10 +399,10 @@ pdf_qa_app/
 ├── chroma_db/                 # （已废弃）v3.2 及以前的本地向量库目录，可手动删除
 ├── app.db                     # 本地 sqlite（不配 DATABASE_URL 时自动生成，不提交）
 └── tests/                     # 单元测试
-    ├── conftest.py            # sys.path + 临时数据库 / Fernet 密钥 fixture
+    ├── conftest.py            # sys.path + 临时数据库 / APP_SECRET_KEY fixture
     ├── test_loader.py         # 文本切分（15 例）
     ├── test_qa.py             # JSON 解析与错误处理（13 例）
-    ├── test_auth.py           # v3 新增：密码哈希 / Key 加解密 / 掩码（16 例）
+    ├── test_auth.py           # 密码哈希 / 平台 Key 读取 / 历史 Key 清理
     ├── test_sessions_isolation.py  # v3 新增：会话隔离与越权防护（6 例）
     ├── test_pptx.py           # v3.1 新增：PPTX 解析与按后缀分发（8 例）
     ├── test_multiturn.py      # v3.1 新增：历史截断与四段提示词（12 例）
@@ -424,14 +428,14 @@ pytest tests/test_loader.py -v       # 只跑切分相关用例
 pytest tests/test_qa.py -k JSON      # 只跑名字含 JSON 的用例
 ```
 
-当前共 **255 passed / 2 skipped**，覆盖 loader 的文本清洗/切句/重叠切分/硬切兜底、PPTX 解析、OCR 自动兜底与强制 OCR、100 页/20MB 硬限制；qa 的 JSON 解析（含代码块围栏、非法 JSON 降级）、错误处理（缺 Key / 401 / 网络失败）、流式输出拼接与多轮历史截断；auth 的密码哈希与 Key 加解密；会话按用户隔离与越权防护；v3.8 的 free/paid 每日额度、文档总数、上传与摘要次数拦截，以及平台 Key 与老用户自填 Key 的优先级。
+当前共 **255 passed / 2 skipped**，覆盖 loader 的文本清洗/切句/重叠切分/硬切兜底、PPTX 解析、OCR 自动兜底与强制 OCR、100 页/20MB 硬限制；qa 的 JSON 解析（含代码块围栏、非法 JSON 降级）、错误处理（缺 Key / 401 / 网络失败）、流式输出拼接与多轮历史截断；auth 的密码哈希、平台 Key 读取与历史 Key 清理；会话按用户隔离与越权防护；v3.8 的 free/paid 每日额度、文档总数、上传与摘要次数拦截，以及所有用户只走平台 Key 的断言。
 
 > 2 个 skipped 是真实 OCR 引擎的冒烟用例，默认跳过以免加载识别模型；设置环境变量 `RUN_REAL_OCR=1` 后可启用。
 
 ## 十一、常见问题
 
 **Q：提示"平台 Key 暂未配置"？**
-A：确认 Streamlit Secrets 或 `.env` 里有 `DEEPSEEK_API_KEY=sk-xxx`（必须是 DeepSeek 官方 Key），改完后重启应用；也可以在设置页临时填写自己的 Key。
+A：确认 Streamlit Secrets 或 `.env` 里有 `DEEPSEEK_API_KEY=sk-xxx`（必须是 DeepSeek 官方 Key），改完后重启应用。统一走平台 Key，用户不用填 Key。
 
 **Q：提示"今日提问次数已用完"或"文档存储已满"？**
 A：免费版每天 5 问、最多存 3 个文档、每天新传 1 个；删掉不需要的文档可腾出存储位置。用量按北京时间 0 点恢复。付费版 9.9/月（50 问 / 50 个文档 / 每天新传 5 个），联系管理员人工开通。

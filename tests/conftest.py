@@ -3,15 +3,15 @@
 pytest 共用配置
 作用：
 1. 把项目根目录（tests 的上一级）加入 sys.path，测试才能 import 到 loader / qa / db / auth；
-2. 提供两个共用 fixture：临时 sqlite 数据库、随机 Fernet 密钥。
+2. 提供两个共用 fixture：临时 sqlite 数据库、随机 APP_SECRET_KEY。
 注意：这里不加载向量模型、不发起任何真实网络请求。
 """
 import os
+import secrets
 import sys
 from datetime import datetime
 
 import pytest
-from cryptography.fernet import Fernet
 
 PROJECT_ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 if PROJECT_ROOT not in sys.path:
@@ -35,9 +35,9 @@ def tmp_db(tmp_path):
 
 
 @pytest.fixture
-def fernet_key(monkeypatch):
-    """注入一个随机 Fernet 密钥到环境变量，保证加密相关测试不依赖真实 .env。"""
-    key = Fernet.generate_key().decode()
+def app_secret(monkeypatch):
+    """注入一个随机 APP_SECRET_KEY，保证验证码 HMAC 等测试不依赖真实 .env。"""
+    key = secrets.token_urlsafe(32)
     monkeypatch.setenv("APP_SECRET_KEY", key)
     monkeypatch.delenv("DATABASE_URL", raising=False)
     return key
@@ -50,7 +50,7 @@ def register_verified(tmp_db, monkeypatch):
     发送邮件函数被替换成空实现，不发起任何真实网络请求。
     """
     if not os.environ.get("APP_SECRET_KEY"):
-        monkeypatch.setenv("APP_SECRET_KEY", Fernet.generate_key().decode())
+        monkeypatch.setenv("APP_SECRET_KEY", secrets.token_urlsafe(32))
     monkeypatch.setattr(
         auth.turnstile, "verify_token", lambda token, remote_ip=None: (True, "")
     )

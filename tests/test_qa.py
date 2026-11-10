@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 from openai import APIConnectionError, AuthenticationError
 
+import qa
 from qa import QAFriendlyError, generate_doc_brief, get_api_key, stream_answer
 
 
@@ -52,7 +53,7 @@ def _fake_api_key(monkeypatch):
 # ---------------- get_api_key ----------------
 
 def test_get_api_key_能读到环境变量中的Key(monkeypatch):
-    """验证 Key 是从环境变量读取的，而不是硬编码在代码里。"""
+    """验证平台 Key 从环境变量读取，而不是硬编码在代码里。"""
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-unit-test-key")
     assert get_api_key() == "sk-unit-test-key"
 
@@ -114,9 +115,9 @@ def test_发送给模型的提示词包含文件名页码和片段原文():
 # ---------------- generate_doc_brief：错误处理 ----------------
 
 def test_缺少APIKey时给出中文提示而不是崩溃(monkeypatch):
-    """未配置 Key 时应抛出带中文指引的 QAFriendlyError。"""
-    monkeypatch.setenv("DEEPSEEK_API_KEY", "")
-    with pytest.raises(QAFriendlyError, match="未检测到 API Key"):
+    """未配置平台 Key 时应抛出带中文指引的 QAFriendlyError。"""
+    monkeypatch.setattr(qa, "get_api_key", lambda: "")
+    with pytest.raises(QAFriendlyError, match="平台 DeepSeek Key 未配置"):
         generate_doc_brief("demo.pdf", [{"text": "片段内容", "page": 1, "source": "demo.pdf"}])
 
 

@@ -1,10 +1,10 @@
 # -*- coding: utf-8 -*-
 """
-db.py（v3.3）
+db.py（v3.10）
 职责：数据库层（单一职责：只管表结构、连接与数据读写，不含任何界面逻辑）。
 - 连接串从环境变量 DATABASE_URL 读取（支持 Streamlit Secrets 注入）；
   未配置时使用本地 sqlite 文件 app.db，方便零配置开发。
-- v3：users（用户账号）与 sessions（聊天会话）两张表，结构保持不变。
+- users（用户账号）与 sessions（聊天会话）两张表，账号不再保存任何用户自填 Key。
 - v3.3 新增三张表，解决「云端重启后文件与解析结果全丢」的持久化问题：
   documents         —— 文档库（归属用户；含摘要 JSON 与原始文件字节）
   document_chunks   —— 文档片段（文本 + 向量；Postgres 走 pgvector，sqlite 存 float32 字节）
@@ -138,12 +138,45 @@ def _migrate_schema():
             conn.exec_driver_sql(
                 "CREATE UNIQUE INDEX IF NOT EXISTS ix_users_email_unique ON users (email)"
             )
+            # v3.10：历史用户自填 Key 一次性置空，不再留在库里。
+            # 新库没有 api_key_enc 列；老库每次启动执行一次幂等清理。
+            if "api_key_enc" in columns:
+                cleared = _null_legacy_api_key_column(conn)
+                if cleared:
+                    import logging
+
+                    logging.getLogger(__name__).info(
+                        "已清理 %d 条历史用户自填 Key", cleared
+                    )
     except Exception:
         # 迁移失败不应阻断应用启动；新库本身已包含这些列。
         # 不记录数据库连接串等敏感信息。
         import logging
 
         logging.getLogger(__name__).exception("users 防刷注册字段迁移失败")
+
+
+def _null_legacy_api_key_column(conn) -> int:
+    """把老库 users.api_key_enc 全部置 NULL；返回本次清理的行数。"""
+    result = conn.exec_driver_sql(
+        "UPDATE users SET api_key_enc = NULL WHERE api_key_enc IS NOT NULL"
+    )
+    return result.rowcount or 0
+
+
+def clear_legacy_api_keys() -> int:
+    """
+    手动清理历史用户自填 Key（幂等）。
+    新库没有 api_key_enc 列时直接返回 0；返回本次实际清空的行数。
+    """
+    inspector = inspect(get_engine())
+    if "users" not in inspector.get_table_names():
+        return 0
+    columns = {c["name"] for c in inspector.get_columns("users")}
+    if "api_key_enc" not in columns:
+        return 0
+    with get_engine().begin() as conn:
+        return _null_legacy_api_key_column(conn)
 
 
 # pgvector 是否可用的缓存结果：True / False / None（还没探测过）
@@ -204,7 +237,6 @@ class User(Base):
     id = Column(Integer, primary_key=True)
     username = Column(String(32), unique=True, nullable=False, index=True)
     password_hash = Column(String(255), nullable=False)  # pbkdf2_sha256$迭代次数$盐$哈希
-    api_key_enc = Column(Text, nullable=True)  # Fernet 加密后的 DeepSeek Key
     tier = Column(String(16), nullable=False, default="free", server_default="free")
     email = Column(String(254), nullable=True, unique=True, index=True)
     email_verified_at = Column(DateTime, nullable=True)
@@ -557,14 +589,6 @@ def update_password_hash(user_id: int, password_hash: str):
         )
 
 
-def update_api_key_enc(user_id: int, api_key_enc: str | None):
-    """更新（或清空，传 None）用户的加密 API Key。"""
-    with session_scope() as db:
-        db.query(User).filter(User.id == user_id).update(
-            {"api_key_enc": api_key_enc}
-        )
-
-
 def set_user_tier(user_id: int, tier: str) -> bool:
     """
     手动设置用户等级（free / paid）。
@@ -591,7 +615,6 @@ def _user_to_dict(user: User) -> dict:
         "id": user.id,
         "username": user.username,
         "password_hash": user.password_hash,
-        "api_key_enc": user.api_key_enc,
         "tier": user.tier or "free",
         "email": user.email,
         "email_verified_at": user.email_verified_at,

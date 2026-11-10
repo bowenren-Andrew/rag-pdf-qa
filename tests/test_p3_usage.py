@@ -182,7 +182,7 @@ def test_流式请求显式开启include_usage():
     fake = _client()
     fake.chat.completions.create.return_value = []
     with patch("qa.OpenAI", return_value=fake):
-        list(stream_answer("问题？", CONTEXTS, api_key="sk-fake", usage_out={}))
+        list(stream_answer("问题？", CONTEXTS, usage_out={}))
 
     kwargs = fake.chat.completions.create.call_args.kwargs
     assert kwargs["stream_options"] == {"include_usage": True}
@@ -205,7 +205,7 @@ def test_流式回答采集usage且不混入正文():
     out = {}
     with patch("qa.OpenAI", return_value=fake):
         pieces = list(
-            stream_answer("问题？", CONTEXTS, api_key="sk-fake", usage_out=out)
+            stream_answer("问题？", CONTEXTS, usage_out=out)
         )
 
     assert "".join(pieces) == "你好"
@@ -223,7 +223,7 @@ def test_流式失败仍抛中文友好错误():
     )
     with patch("qa.OpenAI", return_value=fake):
         try:
-            list(stream_answer("问题？", CONTEXTS, api_key="sk-fake", usage_out={}))
+            list(stream_answer("问题？", CONTEXTS, usage_out={}))
         except QAFriendlyError as e:
             assert "无法连接" in str(e)
         else:
@@ -240,7 +240,7 @@ def test_generate_answer采集usage():
     fake.chat.completions.create.return_value.model = "deepseek-flash"
     out = {}
     with patch("qa.OpenAI", return_value=fake):
-        assert generate_answer("问题？", CONTEXTS, api_key="sk-fake", usage_out=out) == "回答"
+        assert generate_answer("问题？", CONTEXTS, usage_out=out) == "回答"
 
     assert out["total_tokens"] == 100
     assert out["model"] == "deepseek-flash"
@@ -254,7 +254,7 @@ def test_generate_doc_brief采集usage():
     fake.chat.completions.create.return_value.model = "deepseek-flash"
     out = {}
     with patch("qa.OpenAI", return_value=fake):
-        brief = generate_doc_brief("demo.pdf", CONTEXTS, api_key="sk-fake", usage_out=out)
+        brief = generate_doc_brief("demo.pdf", CONTEXTS, usage_out=out)
 
     assert brief["summary"] == "摘要"
     assert out["total_tokens"] == 250

@@ -42,9 +42,9 @@ def test_记录待提问状态():
     assert state["ask_pending"] == "电池更换多少钱？"
 
 
-def _open_chat(tmp_db, username: str):
+def _open_chat(tmp_db, username: str, monkeypatch):
+    monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-platform-test-1234567890")
     user = db.create_user(username, auth.hash_password("Password123"))
-    auth.set_user_api_key(user["id"], "sk-1234567890abcdefghij")
     at = AppTest.from_file(APP_PATH, default_timeout=120)
     at.session_state["user"] = {"id": user["id"], "username": username}
     at.run()
@@ -60,9 +60,9 @@ def _ok_stream(*args, **kwargs):
     yield "这是回答"
 
 
-def test_顶部思考中提示不会残留(tmp_db, fernet_key):
+def test_顶部思考中提示不会残留(tmp_db, app_secret, monkeypatch):
     """真实点击发送后，顶部占位必须清掉，不能和聊天区占位重复或残留。"""
-    at = _open_chat(tmp_db, "p3_banner")
+    at = _open_chat(tmp_db, "p3_banner", monkeypatch)
     at.text_area[0].set_value("电池更换多少钱？").run()
 
     with patch("qa.stream_answer", side_effect=_ok_stream), patch(

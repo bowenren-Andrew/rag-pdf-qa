@@ -3,7 +3,7 @@
 app.py（v3.7 外观改版）
 职责：Streamlit 界面（单一职责：只做交互与展示，业务逻辑在 auth/db/loader/vectorstore/qa）。
 - v3 变更：新增账号体系（注册/登录）、session_state 保存当前用户；
-          知识库与会话按 user_id 隔离；每位用户使用自己的 DeepSeek Key。
+          知识库与会话按 user_id 隔离；所有用户统一使用平台 DeepSeek Key。
 - v3.1 变更：问答支持多轮对话上下文（history 传入 qa 层）；
           文档页支持 PDF 与 PPTX 上传（按后缀分发解析）；
           图片型 PDF 走 OCR 兜底，识别失败的页码用一条提示列出；
@@ -19,12 +19,14 @@ app.py（v3.7 外观改版）
 - v3.7 变更（仅外观）：浅色学习风主题、900px 居中阅读区、顶部品牌栏、
           上传虚线卡片、左右对话气泡、摘要卡与引用出处 pill；业务逻辑与接口不变。
 - v3.8 变更（平台 Key + 额度）：注册后默认使用 Secrets 里的平台官方 Key，
-           用户自填 Key 变为可选覆盖；新增 free/paid 每日额度与 topbar 真实剩余；
+           新增 free/paid 每日额度与 topbar 真实剩余；
            上传前拦截超 100 页 / 20MB 的单文件。
+- v3.10 变更：删除用户自填 Key 入口与用户 Key 优先逻辑，所有用户只走平台 Key；
+           历史库里保存的用户 Key 由启动迁移一次性置空。
 - 页面结构（st.navigation 多页面）：
   1) 💬 问答      —— 聊天、流式回答、引用原文与相似度、文档摘要与推荐问题、会话管理
   2) 📁 我的文档  —— 上传 PDF / PPTX 入库（查重、存库）、已入库列表与删除
-  3) ⚙️ 设置      —— 账号信息、API Key 管理（加密存储 + 掩码显示）、修改密码
+  3) ⚙️ 设置      —— 账号信息、修改密码；不再提供 API Key 入口
 会话数据存放在数据库（见 db.py），不再使用本地 JSON 文件。
 运行方式：streamlit run app.py
 """
@@ -122,7 +124,6 @@ from qa import (  # noqa: E402
     format_usage,
     generate_doc_brief,
     stream_answer,
-    verify_api_key,
 )
 from ui_helpers import (  # noqa: E402
     ask_banner_text,
@@ -499,31 +500,19 @@ def _confirm_delete_session():
         st.rerun()
 
 
-def _saved_user_api_key() -> str:
-    """当前用户自填并加密保存的 Key；未设置返回空字符串（设置页展示用）。"""
-    try:
-        return auth.get_user_api_key(USER_ID)
-    except auth.AuthFriendlyError as e:
-        st.sidebar.warning(str(e))
-        return ""
-
-
 def _current_api_key() -> str:
     """
-    实际调用使用的 Key：优先用户自填的 Key（老用户想用自己的 Key），
-    空着则回退到平台统一 Key。平台 Key 只从 Secrets/env 读取，不落日志、不展示。
+    平台统一 Key：只从 Streamlit Secrets / 环境变量 / 本地 .env 读取，
+    不落日志、不在页面展示，也不再读取任何用户自填 Key。
     """
-    return _saved_user_api_key() or auth.get_platform_api_key()
+    return auth.get_platform_api_key()
 
 
 def _require_key_or_guide() -> str:
-    """取实际可用的 Key；平台未配置且用户也没填时才提示，不抛异常。"""
+    """取平台 Key；未配置时给中文提示，不抛异常。"""
     key = _current_api_key()
     if not key:
-        st.warning(
-            "平台 Key 暂未配置，请联系管理员；你也可以到「⚙️ 设置」页填写自己的 "
-            "DeepSeek Key 后继续使用。"
-        )
+        st.warning("平台 DeepSeek Key 暂未配置，暂时无法提问，请联系管理员。")
     return key
 
 
@@ -879,7 +868,7 @@ def _build_history() -> list[dict]:
 
 
 def handle_question(question: str) -> bool:
-    """处理一次提问：取用户 Key → 检索 → 带历史流式生成 → 展示来源 → 自动保存会话。"""
+    """处理一次提问：取平台 Key → 检索 → 带历史流式生成 → 展示来源 → 自动保存会话。"""
     # 调用前先查当天额度：超限直接中文拦截，不创建会话、不调 API、不记用量。
     snap = quota.snapshot(USER_ID, TIER, ip_hash=IP_HASH)
     allowed, quota_msg = quota.check_question(snap)
@@ -928,7 +917,6 @@ def handle_question(question: str) -> bool:
                         question,
                         contexts,
                         history=history,
-                        api_key=api_key,
                         usage_out=usage,
                     ),
                     on_first=thinking.empty,
@@ -1020,7 +1008,7 @@ def page_documents():
             )
 
     if uploaded_files and parse_clicked:
-        api_key = _current_api_key()  # 平台 Key 兜底；没有则只入库、不生成摘要
+        api_key = _current_api_key()  # 平台 Key；没有则只入库、不生成摘要
         for f in uploaded_files:
             if os.path.splitext(f.name)[1].lower() not in (".pdf", ".pptx"):
                 st.warning(f"《{escape_markdown(f.name)}》格式不支持，仅支持 PDF 与 PPTX，已跳过。")
@@ -1118,8 +1106,8 @@ def page_documents():
                 # 生成结果持久化到文档上，随会话/文档恢复
                 if not api_key:
                     st.info(
-                        f"《{escape_markdown(f.name)}》已入库；平台 Key 未配置且你没有填写自己的 Key，"
-                        "本次未生成摘要与推荐问题。"
+                        f"《{escape_markdown(f.name)}》已入库；"
+                        "平台 Key 未配置，本次未生成摘要与推荐问题。"
                     )
                     continue
                 # 摘要前查当天次数（免费版 5 次，防删传来回刷）；超限只跳过摘要。
@@ -1138,9 +1126,7 @@ def page_documents():
                     )
                     usage = {}
                     quota.record_summary(USER_ID)
-                    brief = generate_doc_brief(
-                        f.name, ctx, api_key=api_key, usage_out=usage
-                    )
+                    brief = generate_doc_brief(f.name, ctx, usage_out=usage)
                     if usage.get("total_tokens"):
                         brief["usage"] = usage  # 随摘要一起持久化，之后仍可看到
                         st.caption("📊 摘要生成 · " + format_usage(usage))
@@ -1219,7 +1205,7 @@ def page_documents():
 
 # ---------- 页面三：⚙️ 设置 ----------
 def page_settings():
-    """设置页：账号信息、API Key 管理（加密 + 掩码）、修改密码。"""
+    """设置页：账号信息、修改密码。所有用户统一使用平台 Key，不提供 Key 入口。"""
     st.markdown("## ⚙️ 设置")
 
     user = db.get_user_by_id(USER_ID) or {}
@@ -1237,67 +1223,6 @@ def page_settings():
             f"当前套餐：{quota.TIER_LABELS[TIER]}。付费版 9.9/月，"
             "开通请通过爱发电或微信转账联系管理员，确认收款后手动开通，页面不接支付。"
         )
-
-    with st.container(border=True, key="settings_key"):
-        st.markdown("**DeepSeek API Key（可选）**")
-        saved_key = _saved_user_api_key()
-        st.code(
-            auth.mask_key(saved_key) if saved_key else "未设置（正在使用平台 Key）",
-            language=None,
-        )
-        st.caption(
-            "默认使用平台统一 Key，空着也能正常提问和生成摘要。"
-            "你也可以填自己的 Key 覆盖平台 Key（老用户兼容）；自填 Key 使用 Fernet 加密保存，只有你自己能用。"
-            "申请地址：[platform.deepseek.com](https://platform.deepseek.com/)"
-        )
-
-        # P3-2：保存成功或删除后清空 Key 输入框，避免明文留在前端 widget 状态里。
-        # 只 pop 旧 key 在真实浏览器里不会让已挂载的 input 清空（AppTest 看不出差异），
-        # 所以这里递增版本号换一个新的 widget key，强制前端重新挂载空输入框。
-        if st.session_state.pop("_reset_api_key_input", False):
-            st.session_state["_api_key_input_version"] = (
-                st.session_state.get("_api_key_input_version", 0) + 1
-            )
-            for stale_key in [
-                k for k in list(st.session_state.keys())
-                if k.startswith("new_api_key_input")
-            ]:
-                st.session_state.pop(stale_key, None)
-
-        api_key_widget_key = (
-            f"new_api_key_input_{st.session_state.get('_api_key_input_version', 0)}"
-        )
-
-        with st.form("api_key_form"):
-            new_key = st.text_input(
-                "填入新的 Key",
-                type="password",
-                placeholder="sk-...",
-                help="可选；保存后会覆盖旧 Key，不填则继续使用平台 Key",
-                key=api_key_widget_key,
-            )
-            saved = st.form_submit_button("保存 Key", type="primary")
-        if saved:
-            try:
-                # 先校验格式，再调一次轻量鉴权接口（GET /models，不消耗 token），
-                # 两步都通过才加密落库，避免把坏 Key 存进去。
-                ok, msg = auth.validate_api_key_format(new_key)
-                if not ok:
-                    raise auth.AuthFriendlyError(msg)
-                with st.spinner("正在验证 Key 是否有效…"):
-                    verify_api_key(new_key)
-                masked = auth.set_user_api_key(USER_ID, new_key)
-                st.session_state["_reset_api_key_input"] = True
-                st.success(f"Key 已验证并加密保存（{masked}）")
-                st.rerun()
-            except (auth.AuthFriendlyError, QAFriendlyError) as e:
-                st.error(str(e))
-
-        if saved_key and st.button("删除已保存的 Key", key="delete_key_btn"):
-            auth.delete_user_api_key(USER_ID)
-            st.session_state["_reset_api_key_input"] = True
-            st.success("已删除保存的 Key，后续将使用平台 Key。")
-            st.rerun()
 
     with st.container(border=True, key="settings_password"):
         st.markdown("**修改密码**")

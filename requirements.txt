@@ -14,12 +14,11 @@ python-dotenv>=1.0.0
 # v3.3 新增：向量持久化用（numpy 做回退路径的余弦计算；Postgres 走 pgvector）
 numpy>=1.26.0
 
-# v3 新增：数据库 ORM、Postgres 驱动、Fernet 加密
+# v3 新增：数据库 ORM、Postgres 驱动
 sqlalchemy>=2.0.0
 # SQLAlchemy 2.1+ 默认使用 psycopg v3 方言（不再需要 psycopg2）；
 # [binary] 附带预编译二进制，云端无需编译环境。
 psycopg[binary]>=3.1.0
-cryptography>=42.0.0
 
 # v3.1 新增：PPTX 解析、PDF 页面渲染、扫描件 OCR
 python-pptx>=1.0.0

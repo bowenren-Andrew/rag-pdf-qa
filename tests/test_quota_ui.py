@@ -65,7 +65,7 @@ def _upload_and_parse(at, filename: str, content: bytes):
     next(b for b in at.button if b.label == "解析并入库").click().run()
 
 
-def test_免费账号第6次提问被拦且不再调API(tmp_db, fernet_key, monkeypatch):
+def test_免费账号第6次提问被拦且不再调API(tmp_db, app_secret, monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-platform-test-1234567890")
     at, user = _open_chat(tmp_db, "quota_ui_six")
     calls = {"n": 0}
@@ -92,7 +92,7 @@ def test_免费账号第6次提问被拦且不再调API(tmp_db, fernet_key, monk
     assert "9.9/月" in msg
 
 
-def test_顶部额度随使用减少(tmp_db, fernet_key, monkeypatch):
+def test_顶部额度随使用减少(tmp_db, app_secret, monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-platform-test-1234567890")
     at, _ = _open_chat(tmp_db, "quota_ui_topbar")
     assert "今日还剩 5 问 / 还可存 3 个文档" in _body(at)
@@ -108,7 +108,7 @@ def test_顶部额度随使用减少(tmp_db, fernet_key, monkeypatch):
     assert "今日还剩 4 问 / 还可存 3 个文档" in _body(at)
 
 
-def test_101页文件在文档页被拦并提示拆分(tmp_db, fernet_key, monkeypatch):
+def test_101页文件在文档页被拦并提示拆分(tmp_db, app_secret, monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-platform-test-1234567890")
     at, _ = _open_documents(tmp_db, "quota_ui_101")
 
@@ -120,7 +120,7 @@ def test_101页文件在文档页被拦并提示拆分(tmp_db, fernet_key, monke
     assert any("请按章节拆分后上传" in e.value for e in at.error)
 
 
-def test_免费账号存满3个文档后再传被拦(tmp_db, fernet_key, monkeypatch):
+def test_免费账号存满3个文档后再传被拦(tmp_db, app_secret, monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-platform-test-1234567890")
     at, user = _open_documents(tmp_db, "quota_ui_docs_full")
     for i in range(3):
@@ -136,7 +136,7 @@ def test_免费账号存满3个文档后再传被拦(tmp_db, fernet_key, monkeyp
     assert "9.9/月" in msg
 
 
-def test_免费账号一天传第2个被拦(tmp_db, fernet_key, monkeypatch):
+def test_免费账号一天传第2个被拦(tmp_db, app_secret, monkeypatch):
     monkeypatch.setenv("DEEPSEEK_API_KEY", "sk-platform-test-1234567890")
     at, user = _open_documents(tmp_db, "quota_ui_upload_daily")
     quota.record_upload(user["id"])

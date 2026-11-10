@@ -1,8 +1,8 @@
 # -*- coding: utf-8 -*-
 """注册页 UI 流程：邮箱验证码与 Turnstile 的双重门槛。"""
 import os
+import secrets
 
-from cryptography.fernet import Fernet
 from streamlit.testing.v1 import AppTest
 
 import auth
@@ -15,7 +15,7 @@ APP_PATH = os.path.join(
 
 def _prepare(monkeypatch):
     """固定验证码、跳过真实邮件/Cloudflare 请求，并提供一个测试 site key。"""
-    monkeypatch.setenv("APP_SECRET_KEY", Fernet.generate_key().decode())
+    monkeypatch.setenv("APP_SECRET_KEY", secrets.token_urlsafe(32))
     monkeypatch.setenv("TURNSTILE_SITE_KEY", "1x00000000000000000000AA")
     monkeypatch.setattr(
         auth.turnstile, "verify_token", lambda token, remote_ip=None: (True, "")
