@@ -14,10 +14,10 @@ _USER_A = {"username": "user_a", "password": "PassA123456"}
 _USER_B = {"username": "user_b", "password": "PassB123456"}
 
 
-def _make_two_users_with_one_session_each():
+def _make_two_users_with_one_session_each(make_verified_user):
     """造数据：两个用户，各自一个会话，返回 (用户A信息, 用户B信息)。"""
-    user_a = auth.register(_USER_A["username"], _USER_A["password"])["user"]
-    user_b = auth.register(_USER_B["username"], _USER_B["password"])["user"]
+    user_a = make_verified_user(_USER_A["username"], _USER_A["password"])
+    user_b = make_verified_user(_USER_B["username"], _USER_B["password"])
 
     session_a = db.create_session(user_a["id"], title="A 的会话")
     session_b = db.create_session(user_b["id"], title="B 的会话")
@@ -29,9 +29,9 @@ def _make_two_users_with_one_session_each():
     }
 
 
-def test_每个用户只能看到自己的会话(tmp_db):
+def test_每个用户只能看到自己的会话(tmp_db, make_verified_user):
     """list_sessions 按 user_id 过滤，看不到别人的会话。"""
-    a, b = _make_two_users_with_one_session_each()
+    a, b = _make_two_users_with_one_session_each(make_verified_user)
 
     sessions_a = db.list_sessions(a["user"]["id"])
     sessions_b = db.list_sessions(b["user"]["id"])
@@ -42,17 +42,17 @@ def test_每个用户只能看到自己的会话(tmp_db):
     assert sessions_a[0]["id"] != sessions_b[0]["id"]
 
 
-def test_读取别人的会话返回None(tmp_db):
+def test_读取别人的会话返回None(tmp_db, make_verified_user):
     """即使知道别人的会话 ID，get_session 也必须返回 None（防越权读取）。"""
-    a, b = _make_two_users_with_one_session_each()
+    a, b = _make_two_users_with_one_session_each(make_verified_user)
 
     assert db.get_session(a["user"]["id"], a["session_id"]) is not None      # 自己的能读
     assert db.get_session(a["user"]["id"], b["session_id"]) is None          # 别人的读不到
 
 
-def test_保存别人的会话会失败(tmp_db):
+def test_保存别人的会话会失败(tmp_db, make_verified_user):
     """用别人的会话 ID 调 save_session 必须返回 False，不能改写他人数据。"""
-    a, b = _make_two_users_with_one_session_each()
+    a, b = _make_two_users_with_one_session_each(make_verified_user)
 
     ok = db.save_session(a["user"]["id"], b["session_id"], [{"role": "user", "content": "越权写入"}])
     assert ok is False
@@ -61,18 +61,18 @@ def test_保存别人的会话会失败(tmp_db):
     assert untouched["messages"][0]["content"] == "B 的提问"  # 内容没被改动
 
 
-def test_删除别人的会话删不掉(tmp_db):
+def test_删除别人的会话删不掉(tmp_db, make_verified_user):
     """delete_session 带 user_id 条件，删别人会话应返回 False 且数据仍在。"""
-    a, b = _make_two_users_with_one_session_each()
+    a, b = _make_two_users_with_one_session_each(make_verified_user)
 
     deleted = db.delete_session(a["user"]["id"], b["session_id"])
     assert deleted is False
     assert db.get_session(b["user"]["id"], b["session_id"]) is not None
 
 
-def test_删除自己的会话可以成功(tmp_db):
+def test_删除自己的会话可以成功(tmp_db, make_verified_user):
     """正常路径：删自己的会话返回 True，之后再查为空。"""
-    a, b = _make_two_users_with_one_session_each()
+    a, b = _make_two_users_with_one_session_each(make_verified_user)
 
     assert db.delete_session(a["user"]["id"], a["session_id"]) is True
     assert db.get_session(a["user"]["id"], a["session_id"]) is None
@@ -80,9 +80,9 @@ def test_删除自己的会话可以成功(tmp_db):
     assert len(db.list_sessions(b["user"]["id"])) == 1  # B 的数据不受影响
 
 
-def test_会话消息读写往返正常(tmp_db):
+def test_会话消息读写往返正常(tmp_db, make_verified_user):
     """自己的会话保存后能完整读回（含中文与 sources 字段）。"""
-    a, _ = _make_two_users_with_one_session_each()
+    a, _ = _make_two_users_with_one_session_each(make_verified_user)
     messages = [
         {"role": "user", "content": "什么是 ACL？"},
         {"role": "assistant", "content": "ACL 分为基本 ACL 与高级 ACL。", "sources": [{"source": "demo.pdf", "page": 3, "score": 0.2, "text": "片段"}]},

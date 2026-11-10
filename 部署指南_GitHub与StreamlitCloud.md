@@ -119,6 +119,14 @@ https://bowenren-andrew-rag-pdf-qa-app-xxxxxx.streamlit.app
 DATABASE_URL = "postgresql://postgres.xxxx:你的密码@aws-0-xxx.pooler.supabase.com:5432/postgres"
 APP_SECRET_KEY = "你的Fernet密钥"
 DEEPSEEK_API_KEY = "sk-你自己的DeepSeek官方Key"
+TURNSTILE_SITE_KEY = "你的Cloudflare-Turnstile-Site-Key"
+TURNSTILE_SECRET_KEY = "你的Cloudflare-Turnstile-Secret-Key"
+SMTP_HOST = "smtp.example.com"
+SMTP_PORT = "587"
+SMTP_USER = "no-reply@example.com"
+SMTP_PASSWORD = "邮箱SMTP授权码"
+SMTP_FROM = "no-reply@example.com"
+SMTP_SECURITY = "starttls"
 ```
 
 4. 点 **Save**，应用会自动重启（约 1 分钟）

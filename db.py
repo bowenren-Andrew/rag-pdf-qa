@@ -108,25 +108,42 @@ def _migrate_schema():
     """
     轻量向后兼容迁移（只做 additive 变更，不改已有列）。
     v3.8：老库的 users 表没有 tier 列，补一列并默认 free；
-    daily_usage 是新车表，由 create_all 负责创建。
+    v3.9（防刷注册）：users 补 email / email_verified_at / registration_ip_hash /
+    registration_date 四列。老账号没有邮箱，视为历史已认证账号，登录不受影响。
+    daily_usage、email_verification_codes、ip_registration_days 都由 create_all 创建。
     """
     try:
         inspector = inspect(get_engine())
         if "users" not in inspector.get_table_names():
             return
         columns = {c["name"] for c in inspector.get_columns("users")}
-        if "tier" in columns:
-            return
+        additions = {
+            "tier": "ALTER TABLE users ADD COLUMN tier VARCHAR(16) NOT NULL DEFAULT 'free'",
+            "email": "ALTER TABLE users ADD COLUMN email VARCHAR(254)",
+            "email_verified_at": "ALTER TABLE users ADD COLUMN email_verified_at TIMESTAMP",
+            "registration_ip_hash": "ALTER TABLE users ADD COLUMN registration_ip_hash VARCHAR(64)",
+            "registration_date": "ALTER TABLE users ADD COLUMN registration_date VARCHAR(10)",
+        }
         with get_engine().begin() as conn:
+            for name, ddl in additions.items():
+                if name not in columns:
+                    conn.exec_driver_sql(ddl)
+            # 历史账号（没有邮箱）保持可用：把它们视为已完成邮箱验证。
+            # 新注册流程一定带邮箱，因此不会被这条语句“放行”。
             conn.exec_driver_sql(
-                "ALTER TABLE users ADD COLUMN tier VARCHAR(16) NOT NULL DEFAULT 'free'"
+                "UPDATE users SET email_verified_at = created_at "
+                "WHERE email IS NULL AND email_verified_at IS NULL"
+            )
+            # Postgres / sqlite 都支持普通唯一索引；多个 NULL 不冲突。
+            conn.exec_driver_sql(
+                "CREATE UNIQUE INDEX IF NOT EXISTS ix_users_email_unique ON users (email)"
             )
     except Exception:
-        # 迁移失败不应阻断应用启动；新库本身已包含 tier 列。
+        # 迁移失败不应阻断应用启动；新库本身已包含这些列。
         # 不记录数据库连接串等敏感信息。
         import logging
 
-        logging.getLogger(__name__).exception("users.tier 字段迁移失败")
+        logging.getLogger(__name__).exception("users 防刷注册字段迁移失败")
 
 
 # pgvector 是否可用的缓存结果：True / False / None（还没探测过）
@@ -189,6 +206,10 @@ class User(Base):
     password_hash = Column(String(255), nullable=False)  # pbkdf2_sha256$迭代次数$盐$哈希
     api_key_enc = Column(Text, nullable=True)  # Fernet 加密后的 DeepSeek Key
     tier = Column(String(16), nullable=False, default="free", server_default="free")
+    email = Column(String(254), nullable=True, unique=True, index=True)
+    email_verified_at = Column(DateTime, nullable=True)
+    registration_ip_hash = Column(String(64), nullable=True, index=True)
+    registration_date = Column(String(10), nullable=True, index=True)
     created_at = Column(DateTime, nullable=False, default=datetime.now)
 
 
@@ -210,6 +231,43 @@ class DailyUsage(Base):
     question_count = Column(Integer, nullable=False, default=0)
     summary_count = Column(Integer, nullable=False, default=0)
     upload_count = Column(Integer, nullable=False, default=0)
+    updated_at = Column(DateTime, nullable=False, default=datetime.now)
+
+
+class EmailVerificationCode(Base):
+    """
+    邮箱验证码（v3.9 防刷注册新增）。
+    - code_hash 存 HMAC-SHA256，不存明文验证码；
+    - request_date 是北京时间的 YYYY-MM-DD，用于「同邮箱一天最多发 5 次」；
+    - consumed_at 非空表示已验证使用，不能重复用。
+    """
+
+    __tablename__ = "email_verification_codes"
+
+    id = Column(Integer, primary_key=True)
+    email = Column(String(254), nullable=False, index=True)
+    code_hash = Column(String(64), nullable=False)
+    request_date = Column(String(10), nullable=False, index=True)
+    created_at = Column(DateTime, nullable=False, default=datetime.now)
+    expires_at = Column(DateTime, nullable=False)
+    attempts = Column(Integer, nullable=False, default=0)
+    consumed_at = Column(DateTime, nullable=True)
+
+
+class IpRegistrationDay(Base):
+    """同一 IP 每天成功注册的账号数（v3.9 防刷注册新增）。"""
+
+    __tablename__ = "ip_registration_days"
+    __table_args__ = (
+        UniqueConstraint(
+            "ip_hash", "registration_date", name="uq_ip_registration_day"
+        ),
+    )
+
+    id = Column(Integer, primary_key=True)
+    ip_hash = Column(String(64), nullable=False, index=True)
+    registration_date = Column(String(10), nullable=False, index=True)
+    count = Column(Integer, nullable=False, default=0)
     updated_at = Column(DateTime, nullable=False, default=datetime.now)
 
 
@@ -320,13 +378,175 @@ def get_user_by_id(user_id: int) -> dict:
         return _user_to_dict(user) if user else None
 
 
-def create_user(username: str, password_hash: str) -> dict:
-    """新建用户，返回创建后的用户信息（不含敏感字段以外的东西）。"""
+class IpRegistrationLimitError(Exception):
+    """同一 IP 当日注册名额已满（由 db 层抛出，auth 转成中文提示）。"""
+
+
+def create_user(
+    username: str,
+    password_hash: str,
+    email: str | None = None,
+    email_verified_at: datetime | None = None,
+    registration_ip_hash: str | None = None,
+    registration_date: str | None = None,
+    max_registrations_per_ip: int = 3,
+) -> dict:
+    """
+    新建用户，返回创建后的用户信息。
+    传入 registration_ip_hash 时，在同一个事务里检查并占用该 IP 当天的注册名额，
+    避免并发请求同时通过「第 4 个」的检查。
+    """
     with session_scope() as db:
-        user = User(username=username, password_hash=password_hash)
+        if registration_ip_hash and registration_date:
+            row = (
+                db.query(IpRegistrationDay)
+                .filter(
+                    IpRegistrationDay.ip_hash == registration_ip_hash,
+                    IpRegistrationDay.registration_date == registration_date,
+                )
+                .with_for_update()
+                .one_or_none()
+            )
+            if row is not None and int(row.count or 0) >= max_registrations_per_ip:
+                raise IpRegistrationLimitError("ip registration limit reached")
+            if row is None:
+                row = IpRegistrationDay(
+                    ip_hash=registration_ip_hash,
+                    registration_date=registration_date,
+                    count=0,
+                )
+                db.add(row)
+                db.flush()
+            row.count = int(row.count or 0) + 1
+            row.updated_at = datetime.now()
+
+        user = User(
+            username=username,
+            password_hash=password_hash,
+            email=email,
+            email_verified_at=email_verified_at,
+            registration_ip_hash=registration_ip_hash,
+            registration_date=registration_date,
+        )
         db.add(user)
         db.flush()  # 先拿到自增 ID
         return _user_to_dict(user)
+
+
+def get_user_by_email(email: str) -> dict | None:
+    """按邮箱查用户；邮箱在入库前已经统一小写。"""
+    with session_scope() as db:
+        user = db.query(User).filter(User.email == email).one_or_none()
+        return _user_to_dict(user) if user else None
+
+
+# ---------------- 邮箱验证码（v3.9 防刷注册新增） ----------------
+def create_email_verification_code(
+    email: str,
+    code_hash: str,
+    request_date: str,
+    created_at: datetime,
+    expires_at: datetime,
+) -> int:
+    """写入一条待验证的验证码记录，返回记录 ID。"""
+    with session_scope() as db:
+        row = EmailVerificationCode(
+            email=email,
+            code_hash=code_hash,
+            request_date=request_date,
+            created_at=created_at,
+            expires_at=expires_at,
+            attempts=0,
+        )
+        db.add(row)
+        db.flush()
+        return row.id
+
+
+def delete_email_verification_code(code_id: int) -> None:
+    """邮件发送失败时回滚刚写入的验证码，避免白白占掉发送次数。"""
+    with session_scope() as db:
+        db.query(EmailVerificationCode).filter(
+            EmailVerificationCode.id == code_id
+        ).delete()
+
+
+def count_recent_email_codes(email: str, since: datetime) -> int:
+    """统计某邮箱在 since 之后发过多少次验证码（用于 1 分钟限频）。"""
+    with session_scope() as db:
+        return (
+            db.query(EmailVerificationCode)
+            .filter(
+                EmailVerificationCode.email == email,
+                EmailVerificationCode.created_at >= since,
+            )
+            .count()
+        )
+
+
+def count_email_codes_on_date(email: str, request_date: str) -> int:
+    """统计某邮箱在指定北京时间日期内发过多少次验证码。"""
+    with session_scope() as db:
+        return (
+            db.query(EmailVerificationCode)
+            .filter(
+                EmailVerificationCode.email == email,
+                EmailVerificationCode.request_date == request_date,
+            )
+            .count()
+        )
+
+
+def consume_email_verification_code(
+    email: str,
+    code_hash: str,
+    now: datetime,
+    max_attempts: int = 5,
+) -> dict:
+    """
+    校验并消费最新一条未使用的验证码。
+    返回 {"ok": bool, "reason": ok|none|expired|attempts|invalid, "attempts": int}。
+    错误验证码会累加 attempts，达到上限后该验证码作废。
+    """
+    with session_scope() as db:
+        row = (
+            db.query(EmailVerificationCode)
+            .filter(
+                EmailVerificationCode.email == email,
+                EmailVerificationCode.consumed_at.is_(None),
+            )
+            .order_by(EmailVerificationCode.id.desc())
+            .with_for_update()
+            .first()
+        )
+        if row is None:
+            return {"ok": False, "reason": "none", "attempts": 0}
+        if row.expires_at <= now:
+            return {"ok": False, "reason": "expired", "attempts": row.attempts or 0}
+        if int(row.attempts or 0) >= max_attempts:
+            return {"ok": False, "reason": "attempts", "attempts": row.attempts}
+        if row.code_hash != code_hash:
+            row.attempts = int(row.attempts or 0) + 1
+            return {
+                "ok": False,
+                "reason": "invalid",
+                "attempts": row.attempts,
+            }
+        row.consumed_at = now
+        return {"ok": True, "reason": "ok", "attempts": row.attempts or 0}
+
+
+def count_users_registered_from_ip(ip_hash: str, registration_date: str) -> int:
+    """某 IP 某天已成功注册的账号数（用于第 4 个注册的早期拦截）。"""
+    with session_scope() as db:
+        return (
+            db.query(User)
+            .filter(
+                User.registration_ip_hash == ip_hash,
+                User.registration_date == registration_date,
+            )
+            .count()
+        )
 
 
 def update_password_hash(user_id: int, password_hash: str):
@@ -373,6 +593,10 @@ def _user_to_dict(user: User) -> dict:
         "password_hash": user.password_hash,
         "api_key_enc": user.api_key_enc,
         "tier": user.tier or "free",
+        "email": user.email,
+        "email_verified_at": user.email_verified_at,
+        "registration_ip_hash": user.registration_ip_hash,
+        "registration_date": user.registration_date,
         "created_at": user.created_at,
     }
 
@@ -451,6 +675,55 @@ def increment_daily_usage(
         # 另一个请求刚好插入了当天行：回滚后按更新路径重试一次。
         _apply()
     return get_daily_usage(user_id, usage_date)
+
+
+def get_ip_free_pool_usage(ip_hash: str, usage_date: str) -> dict:
+    """
+    汇总同一注册 IP 下所有免费账号当天的用量与文档总数（v3.9 防刷注册）。
+    - 只统计 tier=free 的账号，付费账号走自己的额度，不占免费 IP 池；
+    - 老账号没有 registration_ip_hash，不参与任何 IP 统计，行为保持不变。
+    """
+    empty = {
+        "question_count": 0,
+        "summary_count": 0,
+        "upload_count": 0,
+        "document_count": 0,
+        "account_count": 0,
+    }
+    if not ip_hash:
+        return empty
+    with session_scope() as db:
+        user_ids = [
+            row[0]
+            for row in (
+                db.query(User.id)
+                .filter(
+                    User.registration_ip_hash == ip_hash,
+                    User.tier == "free",
+                )
+                .all()
+            )
+        ]
+        if not user_ids:
+            return empty
+        usage_rows = (
+            db.query(DailyUsage)
+            .filter(
+                DailyUsage.user_id.in_(user_ids),
+                DailyUsage.usage_date == usage_date,
+            )
+            .all()
+        )
+        document_count = (
+            db.query(Document).filter(Document.user_id.in_(user_ids)).count()
+        )
+        return {
+            "question_count": sum(int(r.question_count or 0) for r in usage_rows),
+            "summary_count": sum(int(r.summary_count or 0) for r in usage_rows),
+            "upload_count": sum(int(r.upload_count or 0) for r in usage_rows),
+            "document_count": int(document_count),
+            "account_count": len(user_ids),
+        }
 
 
 # ---------------- 会话读写（全部强制带 user_id） ----------------

@@ -95,35 +95,36 @@ def test_未配置服务密钥时给出中文提示(monkeypatch):
 
 
 # ---------------- 注册与登录（走数据库） ----------------
-def test_注册成功后可以登录(tmp_db):
+def test_注册成功后可以登录(register_verified):
     """正常注册后应能用同一组账号密码登录成功。"""
-    result = auth.register("alice", "AlicePass123")
+    result = register_verified("alice", "AlicePass123")
     assert result["ok"] is True
     assert result["user"]["username"] == "alice"
+    assert result["user"]["email_verified_at"] is not None
 
     user = auth.login("alice", "AlicePass123")
     assert user is not None
     assert user["id"] == result["user"]["id"]
 
 
-def test_用户名重复时给出中文提示(tmp_db):
+def test_用户名重复时给出中文提示(register_verified):
     """重名不能静默覆盖，要返回可展示的中文原因。"""
-    auth.register("alice", "AlicePass123")
-    duplicated = auth.register("alice", "AnotherPass123")
+    register_verified("alice", "AlicePass123")
+    duplicated = register_verified("alice", "AnotherPass123")
     assert duplicated["ok"] is False
     assert "已被注册" in duplicated["msg"]
 
 
-def test_登录失败不区分用户名不存在和密码错误(tmp_db):
+def test_登录失败不区分用户名不存在和密码错误(register_verified):
     """两种失败都返回 None，界面统一提示「用户名或密码不正确」。"""
-    auth.register("bob", "BobPass123456")
+    register_verified("bob", "BobPass123456")
     assert auth.login("bob", "wrong-password") is None        # 密码错
     assert auth.login("not_exist_user", "BobPass123456") is None  # 用户不存在
 
 
-def test_修改密码需要正确的旧密码(tmp_db):
+def test_修改密码需要正确的旧密码(register_verified):
     """改密码必须验证旧密码，新密码同样要满足 8 位规则。"""
-    user = auth.register("carol", "CarolPass123")["user"]
+    user = register_verified("carol", "CarolPass123")["user"]
     ok, msg = auth.change_password(user["id"], "wrong-old", "NewPass123456")
     assert ok is False and "旧密码不正确" in msg
 
@@ -135,9 +136,9 @@ def test_修改密码需要正确的旧密码(tmp_db):
     assert auth.login("carol", "NewPass123456") is not None
 
 
-def test_用户Key存取与删除(tmp_db, fernet_key):
+def test_用户Key存取与删除(register_verified, fernet_key):
     """设置页保存的 Key 应能解密读回，删除后读为空字符串。"""
-    user = auth.register("dave", "DavePass123")["user"]
+    user = register_verified("dave", "DavePass123")["user"]
     key = "sk-" + "d" * 32
     auth.set_user_api_key(user["id"], key)
     assert auth.get_user_api_key(user["id"]) == key
@@ -146,9 +147,9 @@ def test_用户Key存取与删除(tmp_db, fernet_key):
     assert auth.get_user_api_key(user["id"]) == ""
 
 
-def test_密文确实写进了数据库(tmp_db, fernet_key):
+def test_密文确实写进了数据库(register_verified, fernet_key):
     """落库的必须是密文，不能直接是明文 Key。"""
-    user = auth.register("erin", "ErinPass123")["user"]
+    user = register_verified("erin", "ErinPass123")["user"]
     key = "sk-" + "e" * 32
     auth.set_user_api_key(user["id"], key)
     stored = db.get_user_by_id(user["id"])
@@ -175,9 +176,9 @@ def test_API_Key格式校验(key, ok):
     assert auth.validate_api_key_format(key)[0] is ok
 
 
-def test_保存非法Key被拒绝且不落库(tmp_db, fernet_key):
+def test_保存非法Key被拒绝且不落库(register_verified, fernet_key):
     """abc 这类非法 Key 必须在落库前被拒绝，并给出明确的中文提示。"""
-    user = auth.register("frank", "FrankPass123")["user"]
+    user = register_verified("frank", "FrankPass123")["user"]
 
     with pytest.raises(auth.AuthFriendlyError) as exc:
         auth.set_user_api_key(user["id"], "abc")

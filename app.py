@@ -79,7 +79,20 @@ def _sync_secrets_to_env():
     保证「本地 .env」和「云端 Secrets」两种部署方式走同一套读取逻辑。
     """
     try:
-        for key in ("DATABASE_URL", "APP_SECRET_KEY", "DEEPSEEK_API_KEY"):
+        for key in (
+            "DATABASE_URL",
+            "APP_SECRET_KEY",
+            "DEEPSEEK_API_KEY",
+            "TURNSTILE_SITE_KEY",
+            "TURNSTILE_SECRET_KEY",
+            "SMTP_HOST",
+            "SMTP_PORT",
+            "SMTP_USER",
+            "SMTP_PASSWORD",
+            "SMTP_FROM",
+            "SMTP_SECURITY",
+            "SMTP_TIMEOUT",
+        ):
             if not os.environ.get(key):  # 已存在的环境变量不覆盖
                 value = st.secrets.get(key, "")
                 if value:
@@ -95,6 +108,8 @@ _sync_secrets_to_env()
 import auth  # noqa: E402
 import db  # noqa: E402
 import quota  # noqa: E402
+import request_ip  # noqa: E402
+import turnstile  # noqa: E402
 from loader import (  # noqa: E402
     FileParseError,
     check_file_limits,
@@ -228,6 +243,9 @@ def render_login_form():
             return
         try:
             user = auth.login(username, password)
+        except auth.AuthFriendlyError as e:
+            st.error(str(e))
+            return
         except Exception as e:
             st.error(f"登录失败：{e}")
             return
@@ -247,30 +265,99 @@ def render_login_form():
                 st.error("用户名或密码不正确")
 
 
+@st.cache_resource(show_spinner=False)
+def _get_turnstile_component():
+    """注册用的本地 Turnstile 自定义组件（不引入额外 pip 依赖）。"""
+    path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "components", "turnstile")
+    return st.components.v1.declare_component("turnstile_guard", path=path)
+
+
+def _reset_turnstile_token():
+    """验证失败后清掉旧 token，并换一个 widget key 让前端重新拉取验证码。"""
+    st.session_state.pop("turnstile_token", None)
+    st.session_state["_turnstile_version"] = (
+        st.session_state.get("_turnstile_version", 0) + 1
+    )
+
+
+def _render_turnstile() -> str:
+    """渲染 Turnstile，返回当前有效的客户端 token（拿不到时为空字符串）。"""
+    site_key = turnstile.site_key()
+    if not site_key:
+        st.warning(
+            "人机验证未配置，暂时无法注册。请管理员在 Streamlit Secrets 中配置 "
+            "TURNSTILE_SITE_KEY 和 TURNSTILE_SECRET_KEY。"
+        )
+        return ""
+    version = st.session_state.get("_turnstile_version", 0)
+    widget_token = _get_turnstile_component()(
+        sitekey=site_key,
+        theme="light",
+        key=f"turnstile_widget_{version}",
+    )
+    if widget_token:
+        st.session_state["turnstile_token"] = str(widget_token)
+    elif widget_token == "":
+        # 组件在 token 过期时会回传空字符串，同步清掉服务端 session_state。
+        st.session_state.pop("turnstile_token", None)
+    token = st.session_state.get("turnstile_token", "")
+    if token:
+        st.caption("人机验证已完成。")
+    else:
+        st.caption("请先完成上方人机验证，再点击注册。")
+    return token
+
+
 def render_register_form():
-    """注册表单：校验用户名与密码规则，重名给出中文提示。"""
+    """注册表单：邮箱验证码 + Turnstile 通过后才创建账号。"""
+    st.markdown("**先完成人机验证**")
+    turnstile_token = _render_turnstile()
     with st.form("register_form"):
         username = st.text_input("设置用户名", placeholder="3–20 位字母、数字或下划线")
+        email = st.text_input("邮箱", placeholder="用于接收 6 位验证码")
         password = st.text_input("设置密码", type="password", help="至少 8 位")
         password2 = st.text_input("确认密码", type="password")
-        submitted = st.form_submit_button("注册", use_container_width=True)
+        verification_code = st.text_input(
+            "邮箱验证码", placeholder="6 位数字", max_chars=auth.EMAIL_CODE_LENGTH
+        )
+        send_code = st.form_submit_button("发送验证码", use_container_width=True)
+        submitted = st.form_submit_button(
+            "注册", use_container_width=True, disabled=not turnstile_token
+        )
+
+    if send_code:
+        result = auth.request_email_code(email)
+        if result["ok"]:
+            st.success(result["msg"])
+        else:
+            st.error(result["msg"])
+        return
+
     if submitted:
+        if not turnstile_token:
+            st.error("请完成人机验证")
+            return
         if password != password2:
             st.error("两次输入的密码不一致。")
             return
-        try:
-            result = auth.register(username, password)
-        except Exception as e:
-            st.error(f"注册失败：{e}")
-            return
+        result = auth.register(
+            username,
+            password,
+            email=email,
+            verification_code=verification_code,
+            turnstile_token=turnstile_token,
+            client_ip=request_ip.get_client_ip(),
+        )
         if result["ok"]:
             # BUG-09：自动切到登录页，并把刚注册的用户名填好
             st.session_state.login_username = username.strip()
             st.session_state.auth_notice = "注册成功，请输入密码登录。"
             st.session_state._switch_to_login = True
+            st.session_state.pop("turnstile_token", None)
             st.rerun()
         else:
             st.error(result["msg"])
+            _reset_turnstile_token()
 
 
 def render_sidebar_user():
@@ -295,12 +382,21 @@ if st.session_state.user is None:
     render_auth_page()
     st.stop()
 
-render_sidebar_user()
-
 USER_ID = st.session_state.user["id"]
 # 每次都从库里读一次等级，管理员手动改成 paid 后无需重新登录即可生效。
 USER = db.get_user_by_id(USER_ID) or st.session_state.user
+if not auth.is_email_verified(USER):
+    # 未验证邮箱的账号不能进入任何业务页面，只能回到登录页。
+    st.session_state.user = None
+    _reset_chat_state()
+    st.session_state.auth_notice = "该账号尚未完成邮箱验证，请重新注册并验证邮箱。"
+    st.rerun()
+
+render_sidebar_user()
+
 TIER = quota.normalize_tier(USER.get("tier"))
+CLIENT_IP = request_ip.get_client_ip()
+IP_HASH = request_ip.hash_ip(CLIENT_IP)
 
 # 顶栏先渲染一次，页面执行完再按最新用量刷新：提问成功后的 rerun 与
 # 上传入库这类不触发 rerun 的操作，都能让顶栏数字及时减少。
@@ -309,7 +405,7 @@ _quota_topbar_slot = st.empty()
 
 def _refresh_quota_topbar() -> None:
     tier = quota.normalize_tier((db.get_user_by_id(USER_ID) or USER).get("tier"))
-    snap = quota.snapshot(USER_ID, tier)
+    snap = quota.snapshot(USER_ID, tier, ip_hash=IP_HASH)
     with _quota_topbar_slot:
         render_topbar(
             quota_value=quota.topbar_text(snap),
@@ -785,7 +881,7 @@ def _build_history() -> list[dict]:
 def handle_question(question: str) -> bool:
     """处理一次提问：取用户 Key → 检索 → 带历史流式生成 → 展示来源 → 自动保存会话。"""
     # 调用前先查当天额度：超限直接中文拦截，不创建会话、不调 API、不记用量。
-    snap = quota.snapshot(USER_ID, TIER)
+    snap = quota.snapshot(USER_ID, TIER, ip_hash=IP_HASH)
     allowed, quota_msg = quota.check_question(snap)
     if not allowed:
         st.warning(quota_msg)
@@ -941,7 +1037,7 @@ def page_documents():
                 continue
 
             # 调用前查额度：文档总数与今日新传次数；超限不解析、不写库。
-            snap = quota.snapshot(USER_ID, TIER)
+            snap = quota.snapshot(USER_ID, TIER, ip_hash=IP_HASH)
             allowed, quota_msg = quota.check_upload(snap)
             if not allowed:
                 st.warning(quota_msg)
@@ -1027,7 +1123,7 @@ def page_documents():
                     )
                     continue
                 # 摘要前查当天次数（免费版 5 次，防删传来回刷）；超限只跳过摘要。
-                snap = quota.snapshot(USER_ID, TIER)
+                snap = quota.snapshot(USER_ID, TIER, ip_hash=IP_HASH)
                 allowed, quota_msg = quota.check_summary(snap)
                 if not allowed:
                     st.warning(quota_msg)

@@ -39,6 +39,14 @@ TIER_LIMITS = {
 
 PAID_PRICE_TEXT = "9.9/月"
 
+# v3.9 防刷注册：同一 IP 最多按 3 个免费账号的合理总量计算。
+# 这些数字由免费版额度 × 3 推导，以后改免费额度会自动跟着变。
+IP_FREE_POOL_ACCOUNTS = 3
+IP_FREE_LIMITS = {
+    key: TIER_LIMITS[TIER_FREE][key] * IP_FREE_POOL_ACCOUNTS
+    for key in ("questions", "summaries", "uploads", "documents")
+}
+
 
 def normalize_tier(tier: str) -> str:
     """未知等级一律按免费版处理，避免脏数据绕过或打崩界面。"""
@@ -55,7 +63,9 @@ def today_str(now: datetime = None) -> str:
     return current.date().isoformat()
 
 
-def snapshot(user_id: int, tier: str, on_date: str = None) -> dict:
+def snapshot(
+    user_id: int, tier: str, on_date: str = None, ip_hash: str = ""
+) -> dict:
     """
     读取当前额度快照：等级、限制、今日已用、当前文档总数与各项剩余。
     界面和调用前拦截都用这一份数据，避免两处规则不一致。
@@ -65,7 +75,7 @@ def snapshot(user_id: int, tier: str, on_date: str = None) -> dict:
     limits = dict(TIER_LIMITS[tier])
     usage = db.get_daily_usage(user_id, usage_date)
     document_count = db.count_user_documents(user_id)
-    return {
+    snap = {
         "tier": tier,
         "tier_label": TIER_LABELS[tier],
         "date": usage_date,
@@ -83,6 +93,28 @@ def snapshot(user_id: int, tier: str, on_date: str = None) -> dict:
         ),
         "remaining_documents": max(limits["documents"] - document_count, 0),
     }
+    # 付费账号只按自己的 tier 算，不进入免费 IP 池。
+    if tier == TIER_FREE and ip_hash:
+        ip_usage = db.get_ip_free_pool_usage(ip_hash, usage_date)
+        snap["ip"] = {
+            "limits": dict(IP_FREE_LIMITS),
+            "used": ip_usage,
+            "remaining_questions": max(
+                IP_FREE_LIMITS["questions"] - int(ip_usage["question_count"] or 0), 0
+            ),
+            "remaining_summaries": max(
+                IP_FREE_LIMITS["summaries"] - int(ip_usage["summary_count"] or 0), 0
+            ),
+            "remaining_uploads": max(
+                IP_FREE_LIMITS["uploads"] - int(ip_usage["upload_count"] or 0), 0
+            ),
+            "remaining_documents": max(
+                IP_FREE_LIMITS["documents"] - int(ip_usage["document_count"] or 0), 0
+            ),
+        }
+    else:
+        snap["ip"] = None
+    return snap
 
 
 def topbar_text(snap: dict) -> str:
@@ -164,10 +196,42 @@ def _over_limit_message(snap: dict, kind: str) -> str:
     return "额度不足，请稍后重试。"
 
 
+def _over_ip_limit_message(kind: str) -> str:
+    """同一网络免费额度用完时的中文提示；付费版不受该限制。"""
+    recovery = "明天 0 点（北京时间）恢复。"
+    if kind == "question":
+        return (
+            f"今天该网络下免费账号的提问额度已用完（共 {IP_FREE_LIMITS['questions']} 次）。"
+            + recovery
+            + "付费版不受该网络限额影响。"
+        )
+    if kind == "summary":
+        return (
+            f"今天该网络下免费账号的摘要额度已用完（共 {IP_FREE_LIMITS['summaries']} 次）。"
+            + recovery
+            + "付费版不受该网络限额影响。"
+        )
+    if kind == "upload":
+        return (
+            f"今天该网络下免费账号的新传文档额度已用完（共 {IP_FREE_LIMITS['uploads']} 个）。"
+            + recovery
+            + "付费版不受该网络限额影响。"
+        )
+    if kind == "documents":
+        return (
+            f"该网络下免费账号的文档存储已满（共 {IP_FREE_LIMITS['documents']} 个）。"
+            "删除不需要的文档后可继续上传。付费版不受该网络限额影响。"
+        )
+    return "该网络免费额度不足，请稍后重试。"
+
+
 def check_question(snap: dict) -> tuple[bool, str]:
     """提问前检查：返回 (是否可继续, 中文提示)；被拦时不调 API、不记用量。"""
     if snap["remaining_questions"] <= 0:
         return False, _over_limit_message(snap, "question")
+    ip_snap = snap.get("ip")
+    if ip_snap is not None and ip_snap["remaining_questions"] <= 0:
+        return False, _over_ip_limit_message("question")
     return True, ""
 
 
@@ -177,6 +241,12 @@ def check_upload(snap: dict) -> tuple[bool, str]:
         return False, _over_limit_message(snap, "documents")
     if snap["remaining_uploads"] <= 0:
         return False, _over_limit_message(snap, "upload")
+    ip_snap = snap.get("ip")
+    if ip_snap is not None:
+        if ip_snap["remaining_documents"] <= 0:
+            return False, _over_ip_limit_message("documents")
+        if ip_snap["remaining_uploads"] <= 0:
+            return False, _over_ip_limit_message("upload")
     return True, ""
 
 
@@ -184,6 +254,9 @@ def check_summary(snap: dict) -> tuple[bool, str]:
     """生成摘要前检查；被拦时文档仍可入库，只是不再调用摘要接口。"""
     if snap["remaining_summaries"] <= 0:
         return False, _over_limit_message(snap, "summary")
+    ip_snap = snap.get("ip")
+    if ip_snap is not None and ip_snap["remaining_summaries"] <= 0:
+        return False, _over_ip_limit_message("summary")
     return True, ""
 
 

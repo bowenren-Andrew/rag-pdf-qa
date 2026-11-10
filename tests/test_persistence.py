@@ -54,10 +54,10 @@ def fake_model():
 
 
 @pytest.fixture
-def two_users(tmp_db):
+def two_users(make_verified_user):
     """两个测试用户（走真实的注册逻辑，拿到各自 user_id）。"""
-    a = auth.register("alice", "password123")["user"]
-    b = auth.register("bob", "password123")["user"]
+    a = make_verified_user("alice", "password123")
+    b = make_verified_user("bob", "password123")
     return a["id"], b["id"]
 
 
@@ -300,11 +300,10 @@ def test_检索结果字段完整(fake_model, two_users):
     assert h["doc_type"] == "pptx"
 
 
-def test_sqlite下走numpy回退路径(fake_model, tmp_db):
+def test_sqlite下走numpy回退路径(fake_model, tmp_db, make_verified_user):
     """本地 sqlite 无 pgvector，检索应走 Python 余弦回退路径且结果正确。"""
     assert db.pgvector_enabled() is False
-    import auth as _auth
-    u = _auth.register("solo", "password123")["user"]
+    u = make_verified_user("solo", "password123")
     vs.add_document(u["id"], "q.pdf", _chunks("回退路径的正文内容。"))
     hits = vs.similarity_search(u["id"], "正文", top_k=1)
     assert hits and hits[0]["source"] == "q.pdf"

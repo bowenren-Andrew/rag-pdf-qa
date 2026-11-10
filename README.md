@@ -201,6 +201,14 @@ python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().d
 ```ini
 APP_SECRET_KEY=粘贴上面命令生成的字符串
 DEEPSEEK_API_KEY=sk-你自己的DeepSeek官方Key
+TURNSTILE_SITE_KEY=你的Cloudflare-Turnstile-Site-Key
+TURNSTILE_SECRET_KEY=你的Cloudflare-Turnstile-Secret-Key
+SMTP_HOST=smtp.example.com
+SMTP_PORT=587
+SMTP_USER=no-reply@example.com
+SMTP_PASSWORD=邮箱SMTP授权码
+SMTP_FROM=no-reply@example.com
+SMTP_SECURITY=starttls
 ```
 
 `DATABASE_URL` 本地**可以留空**，程序会自动使用项目下的 sqlite 文件 `app.db`。
@@ -255,6 +263,14 @@ git add . && git commit -m "feat: RAG PDF QA v2" && git push
 DATABASE_URL = "postgresql://postgres.xxxx:你的密码@aws-0-xxx.pooler.supabase.com:5432/postgres"
 APP_SECRET_KEY = "你的Fernet密钥"
 DEEPSEEK_API_KEY = "sk-你自己的DeepSeek官方Key"
+TURNSTILE_SITE_KEY = "你的Cloudflare-Turnstile-Site-Key"
+TURNSTILE_SECRET_KEY = "你的Cloudflare-Turnstile-Secret-Key"
+SMTP_HOST = "smtp.example.com"
+SMTP_PORT = "587"
+SMTP_USER = "no-reply@example.com"
+SMTP_PASSWORD = "邮箱SMTP授权码"
+SMTP_FROM = "no-reply@example.com"
+SMTP_SECURITY = "starttls"
 ```
 
 保存后应用会自动重启。这三个变量的详细获取步骤见「八、云端部署需要配置的 Secrets」。
@@ -288,6 +304,8 @@ v3.8 需要三个环境变量，缺一个都会影响使用：
 | `DATABASE_URL` | 存用户账号、每日用量、加密后的 Key、文档与会话记录 | Supabase 项目的 Postgres 连接串（见下方步骤） |
 | `APP_SECRET_KEY` | 用 Fernet 加密每位用户的 API Key | 本地执行 `python -c "from cryptography.fernet import Fernet; print(Fernet.generate_key().decode())"` |
 | `DEEPSEEK_API_KEY` | 平台统一调用的官方 DeepSeek Key（注册后即可用，无需用户自填） | [platform.deepseek.com](https://platform.deepseek.com/) 自行创建；必须是官方 Key，不要用临时网关 |
+| `TURNSTILE_SITE_KEY` / `TURNSTILE_SECRET_KEY` | 注册页人机验证（v3.9 防刷注册） | Cloudflare Dashboard → Turnstile 创建站点后获得；Secret Key 只放 Secrets，不写进代码/日志 |
+| `SMTP_HOST` / `SMTP_PORT` / `SMTP_USER` / `SMTP_PASSWORD` / `SMTP_FROM` | 发送注册邮箱验证码 | 邮箱服务商的 SMTP 信息；密码填授权码，不要填网页登录密码 |
 
 > ⚠️ `APP_SECRET_KEY` 一旦更换，之前用户保存的 Key 会解密失败，
 > 届时需要请用户到「⚙️ 设置」页重新填写。

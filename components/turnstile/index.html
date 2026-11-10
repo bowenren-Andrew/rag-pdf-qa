@@ -1,0 +1,99 @@
+<!doctype html>
+<html lang="zh-CN">
+  <head>
+    <meta charset="utf-8" />
+    <style>
+      html, body { margin: 0; padding: 0; background: transparent; font-family: sans-serif; }
+      #turnstile { min-height: 66px; }
+      #status { font-size: 12px; color: #6b7280; margin-top: 4px; }
+    </style>
+  </head>
+  <body>
+    <div id="turnstile"></div>
+    <div id="status">正在加载人机验证…</div>
+    <script>
+      let widgetId = null;
+      let pendingSitekey = "";
+
+      function post(type, payload) {
+        window.parent.postMessage(
+          Object.assign({ isStreamlitMessage: true, type: type }, payload || {}),
+          "*"
+        );
+      }
+
+      function setFrameHeight() {
+        post("streamlit:setFrameHeight", {
+          height: Math.max(document.body.scrollHeight, 70),
+        });
+      }
+
+      function setStatus(text) {
+        document.getElementById("status").textContent = text || "";
+        setFrameHeight();
+      }
+
+      function loadTurnstile(callback) {
+        if (window.turnstile) {
+          callback();
+          return;
+        }
+        const script = document.createElement("script");
+        script.src = "https://challenges.cloudflare.com/turnstile/v0/api.js?render=explicit";
+        script.async = true;
+        script.defer = true;
+        script.onload = callback;
+        script.onerror = function () {
+          setStatus("人机验证加载失败，请刷新页面重试。");
+        };
+        document.head.appendChild(script);
+      }
+
+      function renderWidget(sitekey) {
+        if (!sitekey || widgetId !== null) {
+          return;
+        }
+        pendingSitekey = sitekey;
+        loadTurnstile(function () {
+          widgetId = window.turnstile.render("#turnstile", {
+            sitekey: sitekey,
+            theme: "light",
+            callback: function (token) {
+              setStatus("人机验证已完成。");
+              post("streamlit:setComponentValue", {
+                value: token,
+                dataType: "json",
+              });
+            },
+            "expired-callback": function () {
+              setStatus("人机验证已过期，请重新验证。");
+              post("streamlit:setComponentValue", {
+                value: "",
+                dataType: "json",
+              });
+            },
+            "error-callback": function () {
+              setStatus("人机验证失败，请重试。");
+              post("streamlit:setComponentValue", {
+                value: "",
+                dataType: "json",
+              });
+            },
+          });
+          setStatus("请完成人机验证。");
+        });
+      }
+
+      window.addEventListener("message", function (event) {
+        const data = event.data || {};
+        if (data.type === "streamlit:render") {
+          const args = data.args || {};
+          renderWidget(args.sitekey || pendingSitekey);
+        }
+      });
+
+      post("streamlit:componentReady", { apiVersion: 1 });
+      setFrameHeight();
+    </script>
+  </body>
+</html>
