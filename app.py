@@ -107,6 +107,7 @@ _sync_secrets_to_env()
 
 # 重依赖放在骨架屏之后 import（延迟首屏空白的开始时间，P3 冷启动优化）；
 # noqa 注释是刻意保留的：这里不能把这些 import 提到文件顶部。
+import build_guard  # noqa: E402
 import auth  # noqa: E402
 import db  # noqa: E402
 import quota  # noqa: E402
@@ -145,6 +146,32 @@ from vectorstore import (  # noqa: E402
 
 logger = logging.getLogger(__name__)
 
+_APP_DIR = os.path.dirname(os.path.abspath(__file__))
+
+
+def _verify_loaded_modules() -> None:
+    """检测 Streamlit 热重载后仍加载旧模块的情况，避免修复静默失效。"""
+    stale = build_guard.stale_modules(
+        {
+            "auth": (auth, os.path.join(_APP_DIR, "auth.py")),
+            "db": (db, os.path.join(_APP_DIR, "db.py")),
+            "build_guard": (build_guard, os.path.join(_APP_DIR, "build_guard.py")),
+        }
+    )
+    if not stale:
+        return
+    logger.error(
+        "检测到未重新加载的旧模块（%s），当前进程仍在执行旧代码；"
+        "需要在 Streamlit Cloud 执行 Reboot app 或完整重新部署。",
+        ", ".join(stale),
+    )
+    st.error(
+        "服务端代码未完成更新，登录模块仍是旧版本，暂时无法登录。"
+        "请管理员在 Streamlit Cloud 重新部署（Reboot app）后再试。"
+    )
+    st.stop()
+
+
 try:
     db.init_db()
 except Exception as e:
@@ -156,6 +183,8 @@ except Exception as e:
 if _boot_placeholder is not None:
     _boot_placeholder.empty()
     st.session_state["app_booted"] = True
+
+_verify_loaded_modules()
 
 
 # ---------- 外观主题：只改样式，不改变任何业务逻辑 ----------

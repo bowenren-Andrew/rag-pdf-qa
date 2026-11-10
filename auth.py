@@ -11,6 +11,7 @@ auth.py（v3.10）
 """
 import hashlib
 import hmac
+import logging
 import math
 import os
 import re
@@ -19,12 +20,16 @@ import threading
 import time
 from datetime import datetime, timedelta, timezone
 
+import build_guard
 import db
 import mailer
 import request_ip
 import turnstile
 
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+# 导入时记录源文件指纹，app.py 启动时用它识别 Streamlit 是否还加载着旧模块。
+MODULE_BUILD = build_guard.source_fingerprint(__file__)
+logger = logging.getLogger(__name__)
 
 # PBKDF2 迭代次数（OWASP 建议 2023 年起 sha256 不少于 600000，此处取 480000 兼顾云端算力）
 PBKDF2_ITERATIONS = 480_000
@@ -367,6 +372,9 @@ def login(username: str, password: str) -> dict | None:
     user = db.get_user_by_username(identifier)
     if user is None and "@" in identifier:
         user = db.get_user_by_email(normalize_email(identifier))
+        if user is None:
+            # 只记录长度，不打印邮箱明文；用于线上确认邮箱分支确实执行到了。
+            logger.warning("邮箱登录未命中用户：identifier_len=%d", len(identifier))
     if user is None:
         # 用户不存在时也跑一次哈希，让响应时间与密码错误时接近（防时序探测）
         hash_password(password or "")

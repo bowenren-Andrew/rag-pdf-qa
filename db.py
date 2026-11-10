@@ -35,7 +35,11 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import declarative_base, sessionmaker
 from sqlalchemy.types import UserDefinedType
 
+import build_guard
+
 PROJECT_ROOT = os.path.dirname(os.path.abspath(__file__))
+# 导入时记录源文件指纹，app.py 启动时用它识别 Streamlit 是否还加载着旧模块。
+MODULE_BUILD = build_guard.source_fingerprint(__file__)
 # 本地默认数据库文件路径（已在 .gitignore 中忽略）
 SQLITE_PATH = os.path.join(PROJECT_ROOT, "app.db")
 

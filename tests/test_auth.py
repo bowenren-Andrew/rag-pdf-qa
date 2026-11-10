@@ -257,3 +257,91 @@ def test_修改密码需要正确的旧密码(register_verified):
     assert auth.login("carol", "NewPass123456") is not None
 
 
+
+
+# ---------------- 登录分流：邮箱输入必须走到邮箱查询（本轮真根因回归） ----------------
+def _fake_verified_user():
+    return {
+        "id": 1,
+        "username": "fake_user",
+        "email": "bowenren9@gmail.com",
+        "email_verified_at": datetime.now(),
+        "password_hash": auth.hash_password("Password123"),
+    }
+
+
+def test_带邮箱的登录输入会走邮箱查询(monkeypatch):
+    """
+    回归：带 @ 的输入不能被用户名规则拦回，也不能只查用户名。
+    先按输入原样查用户名，查不到后必须用归一化邮箱再查一次。
+    """
+    calls = []
+    fake = _fake_verified_user()
+    monkeypatch.setattr(
+        auth.db,
+        "get_user_by_username",
+        lambda value: calls.append(("username", value)) or None,
+    )
+    monkeypatch.setattr(
+        auth.db,
+        "get_user_by_email",
+        lambda value: calls.append(("email", value)) or fake,
+    )
+
+    user = auth.login("  BowenRen9@Gmail.com  ", "Password123")
+
+    assert user is fake
+    assert calls == [
+        ("username", "BowenRen9@Gmail.com"),
+        ("email", "bowenren9@gmail.com"),
+    ]
+
+
+def test_邮箱登录不会被用户名格式校验拦回(monkeypatch):
+    """登录链路不应调用 validate_username，否则带 @ 的邮箱永远走不到查库。"""
+
+    def forbidden(_value):
+        raise AssertionError("login() 不应在查库前调用 validate_username")
+
+    fake = _fake_verified_user()
+    monkeypatch.setattr(auth, "validate_username", forbidden)
+    monkeypatch.setattr(auth.db, "get_user_by_username", lambda _value: None)
+    monkeypatch.setattr(auth.db, "get_user_by_email", lambda _value: fake)
+
+    assert auth.login("someone@example.com", "Password123") is fake
+
+
+def test_邮箱登录输入带零宽字符也能命中(tmp_db):
+    """复制粘贴带入的 U+200B 在登录输入侧也要被归一掉。"""
+    db.create_user(
+        "zw_input_user",
+        auth.hash_password("ZwPass12345"),
+        email="bowenren9@gmail.com",
+        email_verified_at=datetime.now(),
+    )
+    user = auth.login("bowenren9@gmail.com\u200b", "ZwPass12345")
+    assert user is not None
+    assert user["username"] == "zw_input_user"
+
+
+@pytest.mark.parametrize(
+    "dialect",
+    [postgresql.dialect(), sqlite.dialect()],
+    ids=["postgres", "sqlite"],
+)
+def test_邮箱归一谓词在两种方言下都能处理零宽字符(dialect):
+    """SQLite 与 Postgres 必须生成同一语义的谓词，不依赖 LIKE/ILIKE。"""
+    key = db.canonical_email(" BowenRen9@Gmail.com\u200b ")
+    assert key == "bowenren9@gmail.com"
+
+    stmt = select(db.User.id).where(db._email_column_key(db.User.email) == key)
+    sql = " ".join(
+        str(stmt.compile(dialect=dialect, compile_kwargs={"literal_binds": True})).split()
+    )
+    lowered = sql.lower()
+
+    assert "bowenren9@gmail.com" in lowered
+    assert "lower(trim(" in lowered
+    assert "replace" in lowered
+    assert " like " not in lowered
+    assert " ilike " not in lowered

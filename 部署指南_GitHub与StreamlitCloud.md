@@ -204,6 +204,7 @@ python -c "import db; print(db.set_user_tier_by_username('用户名', 'paid'))"
 | --- | --- | --- |
 | 部署日志卡在下载模型 | HuggingFace 网络慢 | 代码已内置 `hf-mirror` 镜像；仍失败则 Reboot 重试 |
 | `ModuleNotFoundError` | 依赖没装全 | 确认 `requirements.txt` 在仓库根目录；改完点 Reboot |
+| 代码推上去了但线上行为还是旧的（如邮箱登录失败） | Streamlit 热重载只重跑 app.py，已 import 的 auth/db 不会重新导入 | 应用启动自检会提示「登录模块仍是旧版本」；在 Manage app → Reboot，或改 requirements.txt 触发完整重建 |
 | 应用显示「平台 Key 暂未配置」 | Secrets 没生效 | 检查 Secrets 的 TOML 拼写（键名必须是 `DEEPSEEK_API_KEY`），确认是官方 Key，Save 后等重启完成 |
 | 新账号提问被额度拦 | 免费版额度用完 | 免费版每天 5 问；第二天北京时间 0 点恢复，或联系管理员开通 9.9/月付费版 |
 | 容器重启后文档没了 | 云端无持久磁盘 | 已知限制，重启后需重新上传 PDF（见 README 云端注意事项表） |
