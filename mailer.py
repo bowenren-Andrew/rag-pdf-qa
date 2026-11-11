@@ -83,8 +83,8 @@ def send_verification_code(email: str, code: str) -> None:
     message["To"] = email
     message.set_content(
         "你好，\n\n"
-        f"你的注册验证码是：{code}\n\n"
-        "验证码 10 分钟内有效，仅用于完成注册。\n"
+        f"你的邮箱验证码是：{code}\n\n"
+        "验证码 10 分钟内有效，仅用于登录或注册账号。\n"
         "如果这不是你本人的操作，请忽略本邮件。\n\n"
         "课程资料问答助手"
     )

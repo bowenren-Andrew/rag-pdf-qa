@@ -23,10 +23,12 @@ app.py（v3.7 外观改版）
            上传前拦截超 100 页 / 20MB 的单文件。
 - v3.10 变更：删除用户自填 Key 入口与用户 Key 优先逻辑，所有用户只走平台 Key；
            历史库里保存的用户 Key 由启动迁移一次性置空。
+- v3.11 变更：登录改为邮箱验证码为主入口，新邮箱自动建号；自动建号用户
+           首次进入时可跳过资料引导，之后在设置页修改用户名或设置密码。
 - 页面结构（st.navigation 多页面）：
   1) 💬 问答      —— 聊天、流式回答、引用原文与相似度、文档摘要与推荐问题、会话管理
   2) 📁 我的文档  —— 上传 PDF / PPTX 入库（查重、存库）、已入库列表与删除
-  3) ⚙️ 设置      —— 账号信息、修改密码；不再提供 API Key 入口
+  3) ⚙️ 设置      —— 账号信息、修改用户名、设置/修改密码；不提供 API Key 入口
 会话数据存放在数据库（见 db.py），不再使用本地 JSON 文件。
 运行方式：streamlit run app.py
 """
@@ -172,6 +174,8 @@ def _verify_loaded_modules() -> None:
     st.stop()
 
 
+_verify_loaded_modules()
+
 try:
     db.init_db()
 except Exception as e:
@@ -183,8 +187,6 @@ except Exception as e:
 if _boot_placeholder is not None:
     _boot_placeholder.empty()
     st.session_state["app_booted"] = True
-
-_verify_loaded_modules()
 
 
 # ---------- 外观主题：只改样式，不改变任何业务逻辑 ----------
@@ -211,9 +213,9 @@ if "session_id" not in st.session_state:
     _reset_chat_state()
 
 
-# ---------- 登录 / 注册页 ----------
+# ---------- 登录页：邮箱验证码 / 账号密码 ----------
 def render_auth_page():
-    """未登录时展示的居中登录/注册卡片。"""
+    """未登录时展示的居中登录卡片。"""
     left, mid, right = st.columns([1, 1.6, 1])
     with mid:
         st.markdown(
@@ -224,16 +226,17 @@ def render_auth_page():
             unsafe_allow_html=True,
         )
 
-        # 用 radio 切换登录/注册。注册成功后直接进入应用；
-        # 退出登录时通过 _switch_to_login 回到登录页（在下一次 radio 实例化前生效）。
+        # 两种登录方式；邮箱验证码是默认入口，未注册邮箱会自动创建账号。
         with st.container(border=True, key="auth_card"):
+            modes = ("邮箱验证码登录", "账号密码登录")
             if st.session_state.pop("_switch_to_login", False):
-                # 在 radio 实例化之前写入值，前后端都会显示「登录」；直接 pop 会让
-                # 前端仍保留「注册」的选中态，与已渲染的登录表单不一致。
-                st.session_state["auth_mode"] = "登录"
+                st.session_state["auth_mode"] = modes[0]
+            elif st.session_state.get("auth_mode") not in modes:
+                # 兼容旧会话里遗留的「登录 / 注册」选项。
+                st.session_state["auth_mode"] = modes[0]
             mode = st.radio(
-                "账号操作",
-                ["登录", "注册"],
+                "登录方式",
+                modes,
                 horizontal=True,
                 label_visibility="collapsed",
                 key="auth_mode",
@@ -241,13 +244,22 @@ def render_auth_page():
             notice = st.session_state.pop("auth_notice", None)
             if notice:
                 st.success(notice)
-            if mode == "登录":
-                render_login_form()
+            if mode == "邮箱验证码登录":
+                render_email_code_login_form()
             else:
-                render_register_form()
+                render_password_login_form()
 
 
-def render_login_form():
+def _set_logged_in_user(user: dict) -> None:
+    """所有登录入口共用：写入当前用户并清理上一个账号的聊天状态。"""
+    st.session_state.user = {"id": user["id"], "username": user["username"]}
+    st.session_state.pop("email_login_email", None)
+    st.session_state.pop("email_login_notice", None)
+    st.session_state.pop("_onboarding_dialog_dismissed", None)
+    _reset_chat_state()
+
+
+def render_password_login_form():
     """登录表单：失败统一提示「用户名或密码不正确」，连续失败按账号临时锁定。"""
     # L-05：锁定时把剩余时间直接显示在表单上方，避免用户反复试密码
     locked_remaining = auth.get_login_lock_remaining(
@@ -282,8 +294,7 @@ def render_login_form():
             return
         if user:
             auth.clear_login_failures(username)
-            st.session_state.user = {"id": user["id"], "username": user["username"]}
-            _reset_chat_state()
+            _set_logged_in_user(user)
             st.rerun()
         else:
             locked = auth.record_login_failure(username)
@@ -298,7 +309,7 @@ def render_login_form():
 
 @st.cache_resource(show_spinner=False)
 def _get_turnstile_component():
-    """注册用的本地 Turnstile 自定义组件（不引入额外 pip 依赖）。"""
+    """登录/注册流程共用的本地 Turnstile 自定义组件（不引入额外 pip 依赖）。"""
     path = os.path.join(os.path.dirname(os.path.abspath(__file__)), "components", "turnstile")
     return st.components.v1.declare_component("turnstile_guard", path=path)
 
@@ -316,7 +327,7 @@ def _render_turnstile() -> str:
     site_key = turnstile.site_key()
     if not site_key:
         st.warning(
-            "人机验证未配置，暂时无法注册。请管理员在 Streamlit Secrets 中配置 "
+            "人机验证未配置，暂时无法发送验证码。请管理员在 Streamlit Secrets 中配置 "
             "TURNSTILE_SITE_KEY 和 TURNSTILE_SECRET_KEY。"
         )
         return ""
@@ -335,65 +346,179 @@ def _render_turnstile() -> str:
     if token:
         st.caption("人机验证已完成。")
     else:
-        st.caption("请先完成上方人机验证，再点击注册。")
+        st.caption("请先完成上方人机验证，再获取验证码。")
     return token
 
 
-def render_register_form():
-    """注册表单：邮箱验证码 + Turnstile 通过后才创建账号。"""
+def render_email_code_login_form():
+    """邮箱验证码登录：新邮箱自动建号，老邮箱直接登录。"""
+    pending_email = st.session_state.get("email_login_email", "")
+    if pending_email:
+        notice = st.session_state.pop("email_login_notice", None)
+        if notice:
+            st.success(notice)
+        st.caption(
+            f"验证码已发送至 {pending_email}，10 分钟内有效。"
+            "新邮箱完成验证后会自动创建账号。"
+        )
+        with st.form("email_code_login_form"):
+            verification_code = st.text_input(
+                "邮箱验证码",
+                placeholder="6 位数字",
+                max_chars=auth.EMAIL_CODE_LENGTH,
+                key="login_email_code",
+            )
+            submitted = st.form_submit_button(
+                "登录", use_container_width=True, type="primary"
+            )
+            change_email = st.form_submit_button(
+                "更换邮箱", use_container_width=True
+            )
+
+        if change_email:
+            st.session_state.pop("email_login_email", None)
+            st.session_state.pop("email_login_notice", None)
+            st.session_state.pop("login_email_code", None)
+            st.rerun()
+
+        if submitted:
+            result = auth.login_with_email_code(
+                pending_email,
+                verification_code,
+                client_ip=request_ip.get_client_ip(),
+            )
+            if result["ok"]:
+                _set_logged_in_user(result["user"])
+                st.rerun()
+            else:
+                st.error(result["msg"])
+        return
+
+    st.caption("输入邮箱获取 6 位验证码；未注册的邮箱会自动创建账号。")
     st.markdown("**先完成人机验证**")
     turnstile_token = _render_turnstile()
-    with st.form("register_form"):
-        username = st.text_input("设置用户名", placeholder="3–20 位字母、数字或下划线")
-        email = st.text_input("邮箱", placeholder="用于接收 6 位验证码")
-        password = st.text_input("设置密码", type="password", help="至少 8 位")
-        password2 = st.text_input("确认密码", type="password")
-        verification_code = st.text_input(
-            "邮箱验证码", placeholder="6 位数字", max_chars=auth.EMAIL_CODE_LENGTH
+    with st.form("email_code_send_form"):
+        email = st.text_input(
+            "邮箱",
+            placeholder="用于接收登录验证码",
+            key="email_login_input",
         )
-        send_code = st.form_submit_button("发送验证码", use_container_width=True)
-        submitted = st.form_submit_button(
-            "注册", use_container_width=True, disabled=not turnstile_token
+        send_code = st.form_submit_button(
+            "发送验证码",
+            use_container_width=True,
+            disabled=not turnstile_token,
         )
 
     if send_code:
-        result = auth.request_email_code(email)
-        if result["ok"]:
-            st.success(result["msg"])
-        else:
-            st.error(result["msg"])
-        return
-
-    if submitted:
-        if not turnstile_token:
-            st.error("请完成人机验证")
-            return
-        if password != password2:
-            st.error("两次输入的密码不一致。")
-            return
-        result = auth.register(
-            username,
-            password,
-            email=email,
-            verification_code=verification_code,
-            turnstile_token=turnstile_token,
+        result = auth.request_email_login_code(
+            email,
+            turnstile_token,
             client_ip=request_ip.get_client_ip(),
         )
         if result["ok"]:
-            # 注册成功即进入登录态，和正常登录成功后的状态完全一致。
-            user = result["user"]
-            st.session_state.user = {
-                "id": user["id"],
-                "username": user["username"],
-            }
-            _reset_chat_state()
-            # 下次退出登录时回到登录页，而不是停留在注册页。
-            st.session_state._switch_to_login = True
-            st.session_state.pop("turnstile_token", None)
+            st.session_state["email_login_email"] = result["email"]
+            st.session_state["email_login_notice"] = result["msg"]
+            _reset_turnstile_token()
             st.rerun()
         else:
             st.error(result["msg"])
             _reset_turnstile_token()
+
+
+def _mark_onboarding_dismissed():
+    """用户点关闭时只在本会话内停止重复弹出，资料仍可在设置页补全。"""
+    user = st.session_state.get("user") or {}
+    if user.get("id"):
+        st.session_state["_onboarding_dialog_dismissed"] = str(user["id"])
+
+
+@st.dialog("完善账号信息", on_dismiss=_mark_onboarding_dismissed)
+def _render_onboarding_dialog(user: dict):
+    """自动建号后的首次引导；用户名和密码都可以直接跳过。"""
+    st.caption(
+        "可以现在起一个用户名并设置密码，也可以先跳过。"
+        "临时用户名和密码后续都能在「设置」页修改。"
+    )
+    with st.form("onboarding_form"):
+        username = st.text_input(
+            "用户名（可选）",
+            placeholder="3–20 位字母、数字或下划线",
+            key="onboarding_username",
+        )
+        password = st.text_input(
+            "密码（可选）",
+            type="password",
+            help="至少 8 位；不设置就只能用邮箱验证码登录",
+            key="onboarding_password",
+        )
+        confirm_password = st.text_input(
+            "确认密码",
+            type="password",
+            key="onboarding_password_confirm",
+        )
+        save = st.form_submit_button(
+            "保存并继续", use_container_width=True, type="primary"
+        )
+        skip = st.form_submit_button(
+            "暂时跳过（保留临时用户名）", use_container_width=True
+        )
+
+    if skip:
+        result = auth.finish_onboarding(USER_ID)
+        if not result["ok"]:
+            st.error(result["msg"])
+            return
+        st.session_state.user = {
+            "id": result["user"]["id"],
+            "username": result["user"]["username"],
+        }
+        st.session_state["_app_notice"] = result["msg"]
+        st.rerun()
+
+    if save:
+        result = auth.complete_onboarding(
+            USER_ID,
+            username or user["username"],
+            password=password,
+            confirm_password=confirm_password,
+        )
+        if not result["ok"]:
+            st.error(result["msg"])
+            return
+        st.session_state.user = {
+            "id": result["user"]["id"],
+            "username": result["user"]["username"],
+        }
+        st.session_state["_app_notice"] = result["msg"]
+        st.rerun()
+
+
+def _maybe_render_onboarding() -> None:
+    """自动建号账号首次进入时弹出一次；关闭或跳过都不会反复打扰。"""
+    user = db.get_user_by_id(USER_ID)
+    if not user or not user.get("is_auto_created"):
+        return
+    if user.get("onboarding_completed_at") is not None:
+        return
+    if st.session_state.get("_onboarding_dialog_dismissed") == str(USER_ID):
+        return
+    _render_onboarding_dialog(user)
+
+
+def _maybe_show_password_reminder() -> None:
+    """跳过密码后只提醒一次；设置页入口则始终保留。"""
+    user = db.get_user_by_id(USER_ID)
+    if not user or not user.get("is_auto_created"):
+        return
+    if user.get("onboarding_completed_at") is None:
+        return
+    if user.get("has_password") or user.get("password_reminder_seen_at"):
+        return
+    st.warning(
+        "你还没有设置密码，目前只能使用邮箱验证码登录。"
+        "需要用户名 + 密码登录时，请到「设置」页设置密码。"
+    )
+    db.mark_password_reminder_seen(USER_ID)
 
 
 def render_sidebar_user():
@@ -408,12 +533,13 @@ def render_sidebar_user():
         )
         if st.button("退出登录", use_container_width=True, key="logout_btn"):
             st.session_state.user = None
+            st.session_state["_switch_to_login"] = True
             _reset_chat_state()
             st.rerun()
         st.divider()
 
 
-# 未登录：只显示登录/注册页（st.stop 阻断后面所有内容）
+# 未登录：只显示登录页（st.stop 阻断后面所有内容）
 if st.session_state.user is None:
     render_auth_page()
     st.stop()
@@ -425,10 +551,17 @@ if not auth.is_email_verified(USER):
     # 未验证邮箱的账号不能进入任何业务页面，只能回到登录页。
     st.session_state.user = None
     _reset_chat_state()
-    st.session_state.auth_notice = "该账号尚未完成邮箱验证，请重新注册并验证邮箱。"
+    st.session_state.auth_notice = "该账号尚未完成邮箱验证，请使用邮箱验证码登录完成验证。"
     st.rerun()
 
 render_sidebar_user()
+
+_app_notice = st.session_state.pop("_app_notice", None)
+if _app_notice:
+    st.success(_app_notice)
+
+_maybe_render_onboarding()
+_maybe_show_password_reminder()
 
 TIER = quota.normalize_tier(USER.get("tier"))
 CLIENT_IP = request_ip.get_client_ip()
@@ -1240,44 +1373,95 @@ def page_documents():
 
 # ---------- 页面三：⚙️ 设置 ----------
 def page_settings():
-    """设置页：账号信息、修改密码。所有用户统一使用平台 Key，不提供 Key 入口。"""
+    """设置页：账号信息、修改用户名、设置或修改密码。"""
     st.markdown("## ⚙️ 设置")
 
     user = db.get_user_by_id(USER_ID) or {}
     created = user.get("created_at")
     created_str = created.strftime("%Y-%m-%d %H:%M") if created else "-"
+    notice = st.session_state.pop("_settings_notice", None)
+    if notice:
+        st.success(notice)
 
     with st.container(border=True, key="settings_account"):
         st.markdown("**账号信息**")
         info_cols = st.columns(2)
         info_cols[0].text_input(
-            "用户名", value=st.session_state.user["username"], disabled=True
+            "当前用户名",
+            value=st.session_state.user["username"],
+            disabled=True,
         )
         info_cols[1].text_input("注册时间", value=created_str, disabled=True)
+        st.text_input(
+            "邮箱",
+            value=user.get("email") or "未绑定（历史账号）",
+            disabled=True,
+        )
+        with st.form("username_form"):
+            new_username = st.text_input(
+                "新用户名",
+                value=st.session_state.user["username"],
+                help="3–20 位字母、数字或下划线；不能与其他账号重复。",
+                key="settings_new_username",
+            )
+            rename = st.form_submit_button("更新用户名")
+        if rename:
+            ok, msg = auth.change_username(USER_ID, new_username)
+            if ok:
+                updated = db.get_user_by_id(USER_ID) or user
+                st.session_state.user = {
+                    "id": updated["id"],
+                    "username": updated["username"],
+                }
+                st.session_state["_settings_notice"] = msg
+                st.rerun()
+            else:
+                st.error(msg)
         st.caption(
             f"当前套餐：{quota.TIER_LABELS[TIER]}。付费版 9.9/月，"
             "开通请通过爱发电或微信转账联系管理员，确认收款后手动开通，页面不接支付。"
         )
 
     with st.container(border=True, key="settings_password"):
-        st.markdown("**修改密码**")
-        with st.form("password_form"):
-            old_password = st.text_input("当前密码", type="password")
-            new_password = st.text_input("新密码", type="password", help="至少 8 位")
-            confirm_password = st.text_input("确认新密码", type="password")
-            changed = st.form_submit_button("修改密码")
-        if changed:
-            if new_password != confirm_password:
-                st.error("两次输入的新密码不一致。")
-            else:
-                ok, msg = auth.change_password(USER_ID, old_password, new_password)
-                if ok:
-                    st.success(msg)
-                    st.session_state.user = None  # 修改成功后要求重新登录
-                    _reset_chat_state()
-                    st.rerun()
+        if user.get("has_password"):
+            st.markdown("**修改密码**")
+            with st.form("password_form"):
+                old_password = st.text_input("当前密码", type="password")
+                new_password = st.text_input("新密码", type="password", help="至少 8 位")
+                confirm_password = st.text_input("确认新密码", type="password")
+                changed = st.form_submit_button("修改密码")
+            if changed:
+                if new_password != confirm_password:
+                    st.error("两次输入的新密码不一致。")
                 else:
-                    st.error(msg)
+                    ok, msg = auth.change_password(USER_ID, old_password, new_password)
+                    if ok:
+                        st.session_state["auth_notice"] = msg
+                        st.session_state.user = None
+                        _reset_chat_state()
+                        st.rerun()
+                    else:
+                        st.error(msg)
+        else:
+            st.markdown("**设置密码**")
+            st.caption(
+                "当前账号没有密码，只能使用邮箱验证码登录。"
+                "设置密码后即可使用用户名或邮箱 + 密码登录。"
+            )
+            with st.form("set_password_form"):
+                new_password = st.text_input("新密码", type="password", help="至少 8 位")
+                confirm_password = st.text_input("确认新密码", type="password")
+                changed = st.form_submit_button("设置密码")
+            if changed:
+                if new_password != confirm_password:
+                    st.error("两次输入的新密码不一致。")
+                else:
+                    ok, msg = auth.set_password(USER_ID, new_password)
+                    if ok:
+                        st.session_state["_settings_notice"] = msg
+                        st.rerun()
+                    else:
+                        st.error(msg)
 
 
 # ---------- 多页面导航 ----------

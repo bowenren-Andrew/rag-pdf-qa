@@ -60,6 +60,10 @@ def test_剩余时间提示格式():
     assert auth.format_lock_remaining(30) == "30 秒"
 
 
+def _switch_to_password(at):
+    at.radio[0].set_value("账号密码登录").run()
+
+
 def _login(at, username, password):
     at.text_input[0].set_value(username)
     at.text_input[1].set_value(password)
@@ -70,6 +74,7 @@ def test_界面连续5次失败后锁定且正确密码也被拒绝(tmp_db):
     db.create_user("lock_ui", auth.hash_password("Password123"))
     at = AppTest.from_file(APP_PATH, default_timeout=120)
     at.run()
+    _switch_to_password(at)
 
     for _ in range(auth.LOGIN_MAX_FAILURES):
         _login(at, "lock_ui", "WrongPass123")
@@ -88,6 +93,7 @@ def test_失败未达阈值时正常登录不受影响(tmp_db):
     db.create_user("lock_ok", auth.hash_password("Password123"))
     at = AppTest.from_file(APP_PATH, default_timeout=120)
     at.run()
+    _switch_to_password(at)
 
     _login(at, "lock_ok", "WrongPass123")
     _login(at, "lock_ok", "WrongPass123")

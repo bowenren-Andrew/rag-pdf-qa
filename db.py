@@ -13,10 +13,12 @@ db.py（v3.10）
 """
 import json
 import os
+import re
 from contextlib import contextmanager
 from datetime import datetime
 
 from sqlalchemy import (
+    Boolean,
     Column,
     DateTime,
     ForeignKey,
@@ -121,15 +123,34 @@ def _migrate_schema():
         inspector = inspect(get_engine())
         if "users" not in inspector.get_table_names():
             return
-        columns = {c["name"] for c in inspector.get_columns("users")}
+        column_info = {c["name"]: c for c in inspector.get_columns("users")}
+        columns = set(column_info)
         additions = {
             "tier": "ALTER TABLE users ADD COLUMN tier VARCHAR(16) NOT NULL DEFAULT 'free'",
             "email": "ALTER TABLE users ADD COLUMN email VARCHAR(254)",
             "email_verified_at": "ALTER TABLE users ADD COLUMN email_verified_at TIMESTAMP",
             "registration_ip_hash": "ALTER TABLE users ADD COLUMN registration_ip_hash VARCHAR(64)",
             "registration_date": "ALTER TABLE users ADD COLUMN registration_date VARCHAR(10)",
+            "is_auto_created": (
+                "ALTER TABLE users ADD COLUMN is_auto_created "
+                "BOOLEAN NOT NULL DEFAULT false"
+            ),
+            "onboarding_completed_at": (
+                "ALTER TABLE users ADD COLUMN onboarding_completed_at TIMESTAMP"
+            ),
+            "password_reminder_seen_at": (
+                "ALTER TABLE users ADD COLUMN password_reminder_seen_at TIMESTAMP"
+            ),
         }
         with get_engine().begin() as conn:
+            password_column = column_info.get("password_hash") or {}
+            if password_column and not password_column.get("nullable", True):
+                if get_engine().dialect.name == "sqlite":
+                    _make_sqlite_password_hash_nullable(conn)
+                else:
+                    conn.exec_driver_sql(
+                        "ALTER TABLE users ALTER COLUMN password_hash DROP NOT NULL"
+                    )
             for name, ddl in additions.items():
                 if name not in columns:
                     conn.exec_driver_sql(ddl)
@@ -159,6 +180,59 @@ def _migrate_schema():
         import logging
 
         logging.getLogger(__name__).exception("users 防刷注册字段迁移失败")
+
+
+def _make_sqlite_password_hash_nullable(conn) -> None:
+    """
+    SQLite 不支持 ALTER COLUMN DROP NOT NULL，用保留数据的表重建实现。
+    只移除 password_hash 的 NOT NULL，其余列、索引与业务数据原样保留。
+    """
+    row = conn.exec_driver_sql(
+        "SELECT sql FROM sqlite_master WHERE type='table' AND name='users'"
+    ).fetchone()
+    ddl = row[0] if row else ""
+    if not ddl:
+        return
+    info = conn.exec_driver_sql('PRAGMA table_info("users")').fetchall()
+    password_info = next((item for item in info if item[1] == "password_hash"), None)
+    if password_info is None or int(password_info[3]) == 0:
+        return
+
+    altered = re.sub(
+        r"(?i)(\bpassword_hash\b[^,\n]*?)\s+NOT\s+NULL\b",
+        r"\1",
+        ddl,
+        count=1,
+    )
+    if altered == ddl:
+        return
+
+    columns = [item[1] for item in info]
+    indexes = conn.exec_driver_sql(
+        "SELECT name, sql FROM sqlite_master "
+        "WHERE type='index' AND tbl_name='users' AND sql IS NOT NULL"
+    ).fetchall()
+    column_sql = ", ".join(f'"{name}"' for name in columns)
+    temp_table = "users__password_nullable_old"
+
+    # 关闭 legacy_alter_table 会让 SQLite 改写其他表里的 users 外键；
+    # 本连接没有启用 foreign_keys，打开 legacy 模式可只重命名本表。
+    conn.exec_driver_sql("PRAGMA legacy_alter_table=ON")
+    try:
+        conn.exec_driver_sql(f'ALTER TABLE "users" RENAME TO "{temp_table}"')
+        for name, _sql in indexes:
+            conn.exec_driver_sql(f'DROP INDEX IF EXISTS "{name}"')
+        conn.exec_driver_sql(altered)
+        conn.exec_driver_sql(
+            f'INSERT INTO "users" ({column_sql}) '
+            f'SELECT {column_sql} FROM "{temp_table}"'
+        )
+        conn.exec_driver_sql(f'DROP TABLE "{temp_table}"')
+        for _name, sql in indexes:
+            if sql:
+                conn.exec_driver_sql(sql)
+    finally:
+        conn.exec_driver_sql("PRAGMA legacy_alter_table=OFF")
 
 
 def _null_legacy_api_key_column(conn) -> int:
@@ -241,12 +315,18 @@ class User(Base):
 
     id = Column(Integer, primary_key=True)
     username = Column(String(32), unique=True, nullable=False, index=True)
-    password_hash = Column(String(255), nullable=False)  # pbkdf2_sha256$迭代次数$盐$哈希
+    # 邮箱验证码自动创建的账号一开始没有密码，允许为空。
+    password_hash = Column(String(255), nullable=True)
     tier = Column(String(16), nullable=False, default="free", server_default="free")
     email = Column(String(254), nullable=True, unique=True, index=True)
     email_verified_at = Column(DateTime, nullable=True)
     registration_ip_hash = Column(String(64), nullable=True, index=True)
     registration_date = Column(String(10), nullable=True, index=True)
+    is_auto_created = Column(
+        Boolean, nullable=False, default=False, server_default="false"
+    )
+    onboarding_completed_at = Column(DateTime, nullable=True)
+    password_reminder_seen_at = Column(DateTime, nullable=True)
     created_at = Column(DateTime, nullable=False, default=datetime.now)
 
 
@@ -421,12 +501,15 @@ class IpRegistrationLimitError(Exception):
 
 def create_user(
     username: str,
-    password_hash: str,
+    password_hash: str | None = None,
     email: str | None = None,
     email_verified_at: datetime | None = None,
     registration_ip_hash: str | None = None,
     registration_date: str | None = None,
     max_registrations_per_ip: int = 3,
+    is_auto_created: bool = False,
+    onboarding_completed_at: datetime | None = None,
+    password_reminder_seen_at: datetime | None = None,
 ) -> dict:
     """
     新建用户，返回创建后的用户信息。
@@ -464,6 +547,9 @@ def create_user(
             email_verified_at=email_verified_at,
             registration_ip_hash=registration_ip_hash,
             registration_date=registration_date,
+            is_auto_created=is_auto_created,
+            onboarding_completed_at=onboarding_completed_at,
+            password_reminder_seen_at=password_reminder_seen_at,
         )
         db.add(user)
         db.flush()  # 先拿到自增 ID
@@ -628,6 +714,51 @@ def update_password_hash(user_id: int, password_hash: str):
         )
 
 
+def mark_email_verified(user_id: int, verified_at: datetime) -> bool:
+    """把已有账号标记为邮箱已验证；已经验证过的账号不覆盖原时间。"""
+    with session_scope() as db:
+        rows = db.query(User).filter(
+            User.id == user_id,
+            User.email_verified_at.is_(None),
+        ).update({"email_verified_at": verified_at})
+        return rows > 0
+
+
+def update_username(user_id: int, username: str) -> bool:
+    """更新用户名；唯一索引负责并发兜底。"""
+    with session_scope() as db:
+        rows = db.query(User).filter(User.id == user_id).update(
+            {"username": username}
+        )
+        return rows > 0
+
+
+def complete_user_onboarding(
+    user_id: int,
+    username: str,
+    password_hash: str | None,
+    completed_at: datetime,
+) -> bool:
+    """一次性保存引导结果；密码为空表示用户选择暂时跳过。"""
+    values = {
+        "username": username,
+        "onboarding_completed_at": completed_at,
+    }
+    if password_hash is not None:
+        values["password_hash"] = password_hash
+    with session_scope() as db:
+        rows = db.query(User).filter(User.id == user_id).update(values)
+        return rows > 0
+
+
+def mark_password_reminder_seen(user_id: int, seen_at: datetime | None = None) -> None:
+    """记录一次性的“设置密码”提醒已经展示，避免每次打开都提示。"""
+    with session_scope() as db:
+        db.query(User).filter(User.id == user_id).update(
+            {"password_reminder_seen_at": seen_at or datetime.now()}
+        )
+
+
 def set_user_tier(user_id: int, tier: str) -> bool:
     """
     手动设置用户等级（free / paid）。
@@ -654,11 +785,15 @@ def _user_to_dict(user: User) -> dict:
         "id": user.id,
         "username": user.username,
         "password_hash": user.password_hash,
+        "has_password": bool(user.password_hash),
         "tier": user.tier or "free",
         "email": user.email,
         "email_verified_at": user.email_verified_at,
         "registration_ip_hash": user.registration_ip_hash,
         "registration_date": user.registration_date,
+        "is_auto_created": bool(user.is_auto_created),
+        "onboarding_completed_at": user.onboarding_completed_at,
+        "password_reminder_seen_at": user.password_reminder_seen_at,
         "created_at": user.created_at,
     }
 

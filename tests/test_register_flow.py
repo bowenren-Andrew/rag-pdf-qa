@@ -1,5 +1,5 @@
 # -*- coding: utf-8 -*-
-"""注册页 UI 流程：邮箱验证码与 Turnstile 的双重门槛。"""
+"""登录页邮箱验证码流程：Turnstile 门槛、自动建号与可跳过的首次引导。"""
 import os
 import secrets
 
@@ -24,21 +24,11 @@ def _prepare(monkeypatch):
     monkeypatch.setattr(auth.mailer, "send_verification_code", lambda _e, _c: None)
 
 
-def _open_register(monkeypatch):
+def _open_email_login(monkeypatch):
     _prepare(monkeypatch)
     at = AppTest.from_file(APP_PATH, default_timeout=120)
     at.run()
-    at.radio[0].set_value("注册").run()
-    return at
-
-
-def _fill_register_form(at, username="register_flow", code=""):
-    inputs = {t.label: t for t in at.text_input}
-    inputs["设置用户名"].set_value(username)
-    inputs["邮箱"].set_value(f"{username}@example.com")
-    inputs["设置密码"].set_value("Password123")
-    inputs["确认密码"].set_value("Password123")
-    inputs["邮箱验证码"].set_value(code)
+    assert at.radio[0].value == "邮箱验证码登录"
     return at
 
 
@@ -56,47 +46,60 @@ def _set_turnstile_token(at, token):
     at.run()
 
 
-def test_缺少邮箱验证码不能创建账号(monkeypatch, tmp_db):
-    at = _open_register(monkeypatch)
-    _set_turnstile_token(at, "test-token")
-    _fill_register_form(at)
-
-    _click(at, "注册")
-
-    assert db.get_user_by_username("register_flow") is None
-    assert at.session_state.get("user") is None
-    assert any("验证码" in e.value for e in at.error)
+def _fill_email(at, email):
+    next(t for t in at.text_input if t.label == "邮箱").set_value(email)
 
 
-def test_完整验证流程注册成功并直接进入应用(monkeypatch, tmp_db):
-    at = _open_register(monkeypatch)
-    _set_turnstile_token(at, "test-token")
-    _fill_register_form(at)
-
+def _send_code(at, email):
+    _fill_email(at, email)
     _click(at, "发送验证码")
+
+
+def test_没有Turnstile_token不能发送验证码(monkeypatch, tmp_db):
+    at = _open_email_login(monkeypatch)
+    _fill_email(at, "no_turnstile@example.com")
+
+    send_button = next(b for b in at.button if b.label == "发送验证码")
+    assert send_button.disabled is True
+    assert db.get_user_by_email("no_turnstile@example.com") is None
+    assert at.session_state.get("user") is None
+
+
+def test_完整验证流程自动建号并直接进入应用(monkeypatch, tmp_db):
+    at = _open_email_login(monkeypatch)
+    _set_turnstile_token(at, "test-token")
+    _send_code(at, "new_flow@example.com")
     assert any("验证码已发送" in s.value for s in at.success)
 
-    _fill_register_form(at, code="123456")
-    _click(at, "注册")
+    next(t for t in at.text_input if t.label == "邮箱验证码").set_value("123456")
+    _click(at, "登录")
 
-    assert at.session_state["user"]["username"] == "register_flow"
-    assert db.get_user_by_username("register_flow") is not None
-    assert not any("请输入密码登录" in s.value for s in at.success)
-    assert not any(t.label == "用户名或邮箱" for t in at.text_input)
+    created = db.get_user_by_email("new_flow@example.com")
+    assert created is not None
+    assert created["is_auto_created"] is True
+    assert created["has_password"] is False
+    assert created["email_verified_at"] is not None
+    assert at.session_state["user"]["id"] == created["id"]
     assert any("今日剩余额度" in m.value for m in at.markdown)
 
+    skip_label = "暂时跳过（保留临时用户名）"
+    assert skip_label in [b.label for b in at.button]
+    _click(at, skip_label)
 
-def test_没有Turnstile_token不能注册(monkeypatch, tmp_db):
-    at = _open_register(monkeypatch)
-    _fill_register_form(at, code="123456")
-    elements = at.get("component_instance")
-    if elements:
-        at.session_state[elements[0].proto.id] = None
-        at.session_state[elements[0].key] = None
-    at.session_state["turnstile_token"] = None
-    at.run()
+    finished = db.get_user_by_id(created["id"])
+    assert finished["username"] == created["username"]
+    assert finished["onboarding_completed_at"] is not None
+    assert finished["has_password"] is False
 
-    register_button = next(b for b in at.button if b.label == "注册")
-    assert register_button.disabled is True
-    assert db.get_user_by_username("register_flow") is None
+
+def test_验证码错误被中文提示拦回(monkeypatch, tmp_db):
+    at = _open_email_login(monkeypatch)
+    _set_turnstile_token(at, "test-token")
+    _send_code(at, "wrong_code@example.com")
+
+    next(t for t in at.text_input if t.label == "邮箱验证码").set_value("000000")
+    _click(at, "登录")
+
     assert at.session_state.get("user") is None
+    assert db.get_user_by_email("wrong_code@example.com") is None
+    assert any("验证码不正确" in e.value for e in at.error)

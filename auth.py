@@ -1,6 +1,6 @@
 # -*- coding: utf-8 -*-
 """
-auth.py（v3.10）
+auth.py（v3.11）
 职责：账号体系与平台密钥读取（单一职责：不含界面、不含向量与问答逻辑）。
 - 密码：hashlib.pbkdf2_hmac("sha256", 随机 16 字节盐, 480000 次迭代)，盐与哈希一起存库；
         校验用 hmac.compare_digest 做定长时间比较，避免时序侧信道。
@@ -77,6 +77,9 @@ EMAIL_CODE_RESEND_SECONDS = 60
 EMAIL_CODE_DAILY_LIMIT = 5
 EMAIL_CODE_MAX_ATTEMPTS = 5
 MAX_REGISTRATIONS_PER_IP_PER_DAY = 3
+NO_PASSWORD_MESSAGE = (
+    "该账号未设置密码，请用邮箱验证码登录，或先在设置里设置密码"
+)
 
 BEIJING_TZ = timezone(timedelta(hours=8))
 
@@ -117,6 +120,7 @@ def hash_password(plain: str) -> str:
 def verify_password(plain: str, stored: str) -> bool:
     """校验密码是否正确；格式异常一律判定为失败，不让程序崩溃。"""
     try:
+        stored = stored or ""
         algorithm, iterations, salt_hex, digest_hex = stored.split("$")
         if algorithm != "pbkdf2_sha256":
             return False
@@ -255,9 +259,162 @@ def request_email_code(email: str, sender=None) -> dict:
     }
 
 
+def _consume_verification_code(email: str, verification_code: str) -> dict:
+    """校验并消费邮箱验证码，返回统一的中文结果。"""
+    code = (verification_code or "").strip()
+    if not re.fullmatch(rf"\d{{{EMAIL_CODE_LENGTH}}}", code):
+        return {"ok": False, "msg": "请输入 6 位数字邮箱验证码。"}
+    try:
+        code_hash = _verification_code_hash(email, code)
+    except AuthFriendlyError as e:
+        return {"ok": False, "msg": str(e)}
+
+    code_result = db.consume_email_verification_code(
+        email, code_hash, _utcnow(), max_attempts=EMAIL_CODE_MAX_ATTEMPTS
+    )
+    if code_result["ok"]:
+        return {"ok": True, "msg": ""}
+    reason = code_result["reason"]
+    if reason == "none":
+        message = "请先获取邮箱验证码。"
+    elif reason == "expired":
+        message = "验证码已过期，请重新获取。"
+    elif reason == "attempts":
+        message = "验证码错误次数过多，请重新获取。"
+    else:
+        remaining = max(EMAIL_CODE_MAX_ATTEMPTS - int(code_result["attempts"]), 0)
+        message = f"验证码不正确，还可再试 {remaining} 次。"
+    return {"ok": False, "msg": message}
+
+
+def request_email_login_code(
+    email: str,
+    turnstile_token: str,
+    client_ip: str | None = None,
+    sender=None,
+) -> dict:
+    """邮箱验证码登录的发码入口：先校验邮箱，再校验 Turnstile，最后复用发码逻辑。"""
+    email = normalize_email(email)
+    ok, msg = validate_email(email)
+    if not ok:
+        return {"ok": False, "msg": msg}
+    verified, verify_msg = turnstile.verify_token(turnstile_token, client_ip)
+    if not verified:
+        return {"ok": False, "msg": verify_msg}
+    return request_email_code(email, sender=sender)
+
+
 def is_email_verified(user: dict | None) -> bool:
     """账号是否完成邮箱验证；历史账号在迁移时已补上验证时间。"""
     return bool(user and user.get("email_verified_at") is not None)
+
+
+def _new_temp_username() -> str:
+    """生成唯一的临时用户名；并发冲突由 users.username 唯一索引兜底。"""
+    for _ in range(20):
+        candidate = f"user_{secrets.token_hex(4)}"
+        if db.get_user_by_username(candidate) is None:
+            return candidate
+    raise AuthFriendlyError("账号创建失败，请稍后重试。")
+
+
+def login_with_email_code(
+    email: str,
+    verification_code: str,
+    client_ip: str | None = None,
+) -> dict:
+    """
+    邮箱验证码登录。
+    - 老账号：直接登录；未验证账号在这次验证码校验后视为已验证；
+    - 新邮箱：按同 IP 每日注册限额自动创建无密码账号并直接登录。
+    """
+    email = normalize_email(email)
+    ok, msg = validate_email(email)
+    if not ok:
+        return {"ok": False, "msg": msg, "user": None, "created": False}
+
+    code_result = _consume_verification_code(email, verification_code)
+    if not code_result["ok"]:
+        return {
+            "ok": False,
+            "msg": code_result["msg"],
+            "user": None,
+            "created": False,
+        }
+
+    now = _utcnow()
+    existing = db.get_user_by_email(email)
+    if existing is not None:
+        if not is_email_verified(existing):
+            db.mark_email_verified(existing["id"], now)
+        user = db.get_user_by_id(existing["id"]) or existing
+        logger.info("邮箱验证码登录成功：created=False email_len=%d", len(email))
+        return {"ok": True, "msg": "登录成功。", "user": user, "created": False}
+
+    ip_hash = request_ip.hash_ip(client_ip)
+    registration_date = _beijing_today()
+    if (
+        ip_hash
+        and db.count_users_registered_from_ip(ip_hash, registration_date)
+        >= MAX_REGISTRATIONS_PER_IP_PER_DAY
+    ):
+        return {
+            "ok": False,
+            "msg": f"今天该网络已注册满 {MAX_REGISTRATIONS_PER_IP_PER_DAY} 个，明天再试",
+            "user": None,
+            "created": False,
+        }
+
+    for _ in range(3):
+        temp_username = _new_temp_username()
+        try:
+            user = db.create_user(
+                temp_username,
+                None,
+                email=email,
+                email_verified_at=now,
+                registration_ip_hash=ip_hash or None,
+                registration_date=registration_date if ip_hash else None,
+                max_registrations_per_ip=MAX_REGISTRATIONS_PER_IP_PER_DAY,
+                is_auto_created=True,
+            )
+        except db.IpRegistrationLimitError:
+            return {
+                "ok": False,
+                "msg": f"今天该网络已注册满 {MAX_REGISTRATIONS_PER_IP_PER_DAY} 个，明天再试",
+                "user": None,
+                "created": False,
+            }
+        except Exception:
+            # 并发下同一邮箱可能刚好被另一个请求创建，直接登录那一份。
+            concurrent = db.get_user_by_email(email)
+            if concurrent is not None:
+                if not is_email_verified(concurrent):
+                    db.mark_email_verified(concurrent["id"], now)
+                current = db.get_user_by_id(concurrent["id"]) or concurrent
+                return {
+                    "ok": True,
+                    "msg": "登录成功。",
+                    "user": current,
+                    "created": False,
+                }
+            # 极少数情况下临时用户名刚好被并发抢占，换一个再试。
+            continue
+        logger.info("邮箱验证码自动创建账号：email_len=%d", len(email))
+        return {
+            "ok": True,
+            "msg": "验证码验证成功，已为你创建账号。",
+            "user": user,
+            "created": True,
+        }
+
+    logger.warning("邮箱验证码自动建号失败：email_len=%d", len(email))
+    return {
+        "ok": False,
+        "msg": "账号创建失败，请稍后重试。",
+        "user": None,
+        "created": False,
+    }
 
 
 # ---------------- 注册与登录 ----------------
@@ -309,30 +466,10 @@ def register(
     if db.get_user_by_email(email):
         return {"ok": False, "msg": "该邮箱已注册，请直接登录或换一个邮箱。", "user": None}
 
-    code = (verification_code or "").strip()
-    if not re.fullmatch(rf"\d{{{EMAIL_CODE_LENGTH}}}", code):
-        return {"ok": False, "msg": "请输入 6 位数字邮箱验证码。", "user": None}
-    try:
-        code_hash = _verification_code_hash(email, code)
-    except AuthFriendlyError as e:
-        return {"ok": False, "msg": str(e), "user": None}
-
     now = _utcnow()
-    code_result = db.consume_email_verification_code(
-        email, code_hash, now, max_attempts=EMAIL_CODE_MAX_ATTEMPTS
-    )
+    code_result = _consume_verification_code(email, verification_code)
     if not code_result["ok"]:
-        reason = code_result["reason"]
-        if reason == "none":
-            message = "请先获取邮箱验证码。"
-        elif reason == "expired":
-            message = "验证码已过期，请重新获取。"
-        elif reason == "attempts":
-            message = "验证码错误次数过多，请重新获取。"
-        else:
-            remaining = max(EMAIL_CODE_MAX_ATTEMPTS - int(code_result["attempts"]), 0)
-            message = f"验证码不正确，还可再试 {remaining} 次。"
-        return {"ok": False, "msg": message, "user": None}
+        return {"ok": False, "msg": code_result["msg"], "user": None}
 
     try:
         user = db.create_user(
@@ -379,10 +516,12 @@ def login(username: str, password: str) -> dict | None:
         # 用户不存在时也跑一次哈希，让响应时间与密码错误时接近（防时序探测）
         hash_password(password or "")
         return None
+    if not user.get("password_hash"):
+        raise AuthFriendlyError(NO_PASSWORD_MESSAGE)
     if not verify_password(password or "", user["password_hash"]):
         return None
     if not is_email_verified(user):
-        raise AuthFriendlyError("该账号尚未完成邮箱验证，请重新注册并验证邮箱。")
+        raise AuthFriendlyError("该账号尚未完成邮箱验证，请使用邮箱验证码登录完成验证。")
     return user
 
 
@@ -391,6 +530,8 @@ def change_password(user_id: int, old_password: str, new_password: str) -> tuple
     user = db.get_user_by_id(user_id)
     if user is None:
         return False, "用户不存在。"
+    if not user.get("password_hash"):
+        return False, "该账号尚未设置密码，请使用“设置密码”功能。"
     if not verify_password(old_password or "", user["password_hash"]):
         return False, "旧密码不正确。"
     ok, msg = validate_password(new_password)
@@ -398,6 +539,94 @@ def change_password(user_id: int, old_password: str, new_password: str) -> tuple
         return False, msg
     db.update_password_hash(user_id, hash_password(new_password))
     return True, "密码修改成功，请重新登录。"
+
+
+def set_password(user_id: int, new_password: str) -> tuple[bool, str]:
+    """为无密码账号设置密码。"""
+    ok, msg = validate_password(new_password)
+    if not ok:
+        return False, msg
+    if db.get_user_by_id(user_id) is None:
+        return False, "用户不存在。"
+    db.update_password_hash(user_id, hash_password(new_password))
+    return True, "密码设置成功，之后可使用用户名或邮箱 + 密码登录。"
+
+
+def change_username(user_id: int, new_username: str) -> tuple[bool, str]:
+    """修改用户名，沿用注册时的长度、字符与唯一性规则。"""
+    new_username = (new_username or "").strip()
+    ok, msg = validate_username(new_username)
+    if not ok:
+        return False, msg
+    user = db.get_user_by_id(user_id)
+    if user is None:
+        return False, "用户不存在。"
+    if user["username"] == new_username:
+        return True, "用户名未变化。"
+    existing = db.get_user_by_username(new_username)
+    if existing is not None and existing["id"] != user_id:
+        return False, "该用户名已被注册，请换一个。"
+    try:
+        db.update_username(user_id, new_username)
+    except Exception:
+        return False, "该用户名已被注册，请换一个。"
+    return True, "用户名已更新。"
+
+
+def complete_onboarding(
+    user_id: int,
+    username: str,
+    password: str = "",
+    confirm_password: str | None = None,
+) -> dict:
+    """保存首次登录引导：用户名可保留临时名，密码可跳过。"""
+    username = (username or "").strip()
+    ok, msg = validate_username(username)
+    if not ok:
+        return {"ok": False, "msg": msg, "user": None}
+
+    password = password or ""
+    password_hash = None
+    if password:
+        ok, msg = validate_password(password)
+        if not ok:
+            return {"ok": False, "msg": msg, "user": None}
+        if confirm_password is not None and password != confirm_password:
+            return {"ok": False, "msg": "两次输入的密码不一致。", "user": None}
+        password_hash = hash_password(password)
+
+    user = db.get_user_by_id(user_id)
+    if user is None:
+        return {"ok": False, "msg": "用户不存在。", "user": None}
+    existing = db.get_user_by_username(username)
+    if existing is not None and existing["id"] != user_id:
+        return {"ok": False, "msg": "该用户名已被注册，请换一个。", "user": None}
+    try:
+        db.complete_user_onboarding(user_id, username, password_hash, _utcnow())
+    except Exception:
+        return {
+            "ok": False,
+            "msg": "保存失败，用户名可能已被占用，请换一个再试。",
+            "user": None,
+        }
+    updated = db.get_user_by_id(user_id)
+    return {"ok": True, "msg": "账号设置已保存。", "user": updated}
+
+
+def finish_onboarding(user_id: int) -> dict:
+    """跳过引导：保留临时用户名、暂不设密码，但记录引导已完成。"""
+    user = db.get_user_by_id(user_id)
+    if user is None:
+        return {"ok": False, "msg": "用户不存在。", "user": None}
+    try:
+        db.complete_user_onboarding(user_id, user["username"], None, _utcnow())
+    except Exception:
+        return {"ok": False, "msg": "保存失败，请稍后重试。", "user": None}
+    return {
+        "ok": True,
+        "msg": "已保留临时用户名，可稍后在设置页修改。",
+        "user": db.get_user_by_id(user_id),
+    }
 
 
 # ---------------- 登录限流（L-05） ----------------

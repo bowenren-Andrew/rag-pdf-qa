@@ -273,7 +273,7 @@ GLOBAL_CSS = """
     padding: 10px 22px 20px 22px !important;
   }
 
-  /* 单选：登录 / 注册 做成轻量分段控件 */
+  /* 单选：登录方式做成轻量分段控件 */
   [data-testid="stRadioGroup"] {
     display: flex;
     gap: 4px;
@@ -306,6 +306,7 @@ GLOBAL_CSS = """
     text-align: center;
     font-size: 14px;
     font-weight: 600;
+    white-space: nowrap;
   }
 
   [data-testid="stRadio"] > div[role="radiogroup"] {
@@ -329,6 +330,7 @@ GLOBAL_CSS = """
   [data-testid="stRadio"] [data-testid="stMarkdownContainer"] p {
     font-size: 14px;
     font-weight: 600;
+    white-space: nowrap;
   }
 
   /* Streamlit 表单默认带内层边框，交给外层卡片负责视觉边界 */
